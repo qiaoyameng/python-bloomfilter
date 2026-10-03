@@ -17,9 +17,13 @@ import pickle
 import random
 import tempfile
 
+from struct import calcsize
+
 import pytest
 
-from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+from pybloom_live.pybloom import (
+    BloomFilter, CountingBloomFilter, ScalableBloomFilter, make_hashfuncs
+)
 
 
 # =============================================================================
@@ -781,6 +785,174 @@ class TestSerialization:
 # =============================================================================
 # ScalableBloomFilter Tests
 # =============================================================================
+
+
+class TestCountingBloomFilter:
+    """Tests for credential-based deletion in a counting Bloom filter."""
+
+    def test_duplicate_insertions_have_independent_credentials(self):
+        cbf = CountingBloomFilter(capacity=10, error_rate=0.05)
+
+        first = cbf.add("same-key")
+        second = cbf.add("same-key")
+
+        assert first != second
+        assert "same-key" in cbf
+        assert len(cbf) == 2
+        assert cbf.revoke(first) is True
+        assert "same-key" in cbf
+        assert len(cbf) == 1
+        assert cbf.revoke(first) is False
+        assert cbf.revoke(second) is True
+        assert "same-key" not in cbf
+        assert len(cbf) == 0
+
+    def test_forged_cross_filter_and_garbage_credentials_cannot_mutate(self):
+        cbf = CountingBloomFilter(capacity=10, error_rate=0.05)
+        other = CountingBloomFilter(capacity=10, error_rate=0.05)
+        credential = cbf.add("key")
+
+        forged = bytearray(credential)
+        forged[-1] ^= 1
+
+        assert cbf.revoke(bytes(forged)) is False
+        assert cbf.revoke(other.add("other-key")) is False
+        assert cbf.revoke(b"not-a-credential") is False
+        assert cbf.revoke(None) is False
+        assert cbf.revoke(credential) is True
+        assert cbf.revoke(credential) is False
+        assert "key" not in cbf
+
+    def test_constructed_hash_collision_has_no_false_negative(self):
+        cbf = CountingBloomFilter(capacity=2, error_rate=0.5)
+        target = tuple(cbf._positions_for(0))
+        collision = next(
+            candidate
+            for candidate in range(1, 10000)
+            if tuple(cbf._positions_for(candidate)) == target
+        )
+
+        first = cbf.add(0)
+        second = cbf.add(collision)
+
+        assert tuple(cbf._positions_for(collision)) == target
+        assert all(cbf.counters[position] == 2 for position in target)
+        assert cbf.revoke(first) is True
+        assert collision in cbf
+        assert cbf.revoke(second) is True
+        assert 0 not in cbf
+        assert collision not in cbf
+        assert all(counter == 0 for counter in cbf.counters)
+
+    def test_overflow_rejects_entire_insertion(self):
+        cbf = CountingBloomFilter(
+            capacity=300,
+            error_rate=0.5,
+            counter_bits=8,
+            credential_capacity=300,
+        )
+        credentials = [cbf.add("saturated") for _ in range(255)]
+        positions = cbf._positions_for("saturated")
+
+        with pytest.raises(OverflowError):
+            cbf.add("saturated")
+
+        assert len(cbf) == 255
+        assert all(cbf.counters[position] == cbf.counter_max
+                   for position in positions)
+        assert cbf.revoke(credentials[-1]) is True
+        assert "saturated" in cbf
+        assert all(cbf.counters[position] == cbf.counter_max - 1
+                   for position in positions)
+
+    def test_active_credential_capacity_is_bounded(self):
+        cbf = CountingBloomFilter(
+            capacity=10, error_rate=0.05, credential_capacity=1
+        )
+        credential = cbf.add("one")
+
+        with pytest.raises(IndexError, match="active credential table"):
+            cbf.add("two")
+        assert cbf.active_credential_count == 1
+        assert cbf.revoke(credential) is True
+        replacement = cbf.add("two")
+        assert cbf.active_credential_count == 1
+        assert cbf.revoke(replacement) is True
+
+    def test_serialization_preserves_counters_credentials_and_costs(self):
+        cbf = CountingBloomFilter(capacity=20, error_rate=0.05)
+        first = cbf.add("shared")
+        second = cbf.add("shared")
+        third = cbf.add("separate")
+        cbf.revoke(third)
+        header_size = CountingBloomFilter._HEADER_FMT
+        payload = io.BytesIO()
+        expected_size = cbf.persistent_size_bytes
+
+        cbf.tofile(payload)
+        serialized = payload.getvalue()
+        payload.seek(0)
+        restored = CountingBloomFilter.fromfile(payload)
+
+        assert restored.persistent_size_bytes == expected_size == len(serialized)
+        assert restored.generation == cbf.generation
+        assert restored.counters.tolist() == cbf.counters.tolist()
+        assert restored.active_credential_count == 2
+        expected_credential_cost = restored.credential_persistent_size_bytes
+        expected_persistent_size = restored.persistent_size_bytes
+        assert restored.revoke(first) is True
+        assert restored.revoke(second) is True
+        assert "shared" not in restored
+        assert restored.credential_capacity_persistent_size_bytes >= \
+            expected_credential_cost
+        assert calcsize(header_size) + \
+            restored.counter_persistent_size_bytes + \
+            expected_credential_cost == \
+            expected_persistent_size
+
+    def test_pickle_preserves_credential_validity(self):
+        cbf = CountingBloomFilter(capacity=10, error_rate=0.05)
+        credential = cbf.add("pickled")
+
+        restored = pickle.loads(pickle.dumps(cbf))
+
+        assert restored.revoke(credential) is True
+        assert "pickled" not in restored
+
+    def test_copy_preserves_credential_validity(self):
+        cbf = CountingBloomFilter(capacity=10, error_rate=0.05)
+        credential = cbf.add("copied")
+
+        copied = cbf.copy()
+        assert copied.revoke(credential) is True
+        assert "copied" in cbf
+        assert "copied" not in copied
+
+    def test_corrupt_counters_are_rejected_on_restore(self):
+        cbf = CountingBloomFilter(capacity=10, error_rate=0.05)
+        cbf.add("valid")
+        payload = io.BytesIO()
+        cbf.tofile(payload)
+        raw = bytearray(payload.getvalue())
+        header_size = calcsize(CountingBloomFilter._HEADER_FMT)
+        raw[header_size] ^= 1
+
+        with pytest.raises(ValueError, match="Counter values"):
+            CountingBloomFilter.fromfile(io.BytesIO(bytes(raw)))
+
+    def test_invalid_counter_width(self):
+        with pytest.raises(ValueError, match="Counter width"):
+            CountingBloomFilter(capacity=10, counter_bits=12)
+
+    def test_set_operations_are_unsupported(self):
+        first = CountingBloomFilter(capacity=10, error_rate=0.05)
+        second = CountingBloomFilter(capacity=10, error_rate=0.05)
+
+        with pytest.raises(TypeError):
+            first.union(second)
+        with pytest.raises(TypeError):
+            first.intersection(second)
+
 
 class TestScalableBloomFilter:
     """Test ScalableBloomFilter specific functionality."""

@@ -2,7 +2,7 @@
 """Setup script for pybloom_live - Python 3 Bloom Filter implementation."""
 from setuptools import setup
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 DESCRIPTION = "Bloom filter: A Probabilistic data structure"
 LONG_DESCRIPTION = """
 A fast, pure-Python Bloom filter implementation with optimized hash functions.
@@ -12,8 +12,9 @@ consistently used throughout. Choosing a ratio around 0.8-0.9 results in better
 average space usage across a wide range of growth patterns, which is why the
 default mode is set to LARGE_SET_GROWTH.
 
-This module provides two implementations:
+This module provides three implementations:
 - BloomFilter: Fixed-capacity filter for known dataset sizes
+- CountingBloomFilter: Opaque credentials support individual revocation
 - ScalableBloomFilter: Dynamically growing filter that scales automatically
 
 Features:

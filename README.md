@@ -18,9 +18,10 @@ A Bloom filter is a space-efficient probabilistic data structure that is used to
 
 ## Features
 
-- **Two implementations:**
+- **Three implementations:**
   - `BloomFilter`: Fixed-capacity filter for known dataset sizes
   - `ScalableBloomFilter`: Automatically grows to accommodate more elements
+  - `CountingBloomFilter`: Opaque one-use credentials make individual insertions revocable
 
 - **High performance:** Uses xxHash for 128-bit hashing - one of the fastest non-cryptographic hash functions available
 
@@ -110,6 +111,42 @@ print(10000 in sbf)  # False
 **Growth modes:**
 - `SMALL_SET_GROWTH = 2`: Slower growth, uses less memory
 - `LARGE_SET_GROWTH = 4`: Faster growth (default), better for large datasets
+
+### CountingBloomFilter
+
+A normal Bloom bitmap cannot safely delete entries because several keys can share a bit.
+`CountingBloomFilter` replaces bits with counters. Each insertion returns an opaque
+credential for only that insertion; revocation requires the credential and never
+performs "the key currently exists, so subtract" deletion.
+
+```python
+import pybloom_live
+
+cbf = pybloom_live.CountingBloomFilter(capacity=1000, error_rate=0.001)
+first = cbf.add("session-id")
+second = cbf.add("session-id")
+
+assert cbf.revoke(first) is True
+assert "session-id" in cbf
+assert cbf.revoke(second) is True
+assert "session-id" not in cbf
+assert cbf.revoke(first) is False
+```
+
+Credentials bind the filter generation and exact counter positions authorized by the
+bounded active credential table. Tampered credentials, credentials issued by another
+filter, and replays return `False` without changing counters.
+
+`credential_capacity` defaults to `capacity` and bounds simultaneously revocable
+insertions. Public persistence costs are `counter_persistent_size_bytes`,
+`credential_persistent_size_bytes`,
+`credential_capacity_persistent_size_bytes`, and `persistent_size_bytes`.
+`tofile()` preserves counters, the generation, and credential validity. Serialized
+files are authoritative revocation state and should be kept private.
+
+Counters default to 8, 16, 32, or 64 bits wide, chosen so the filter can represent
+at least `capacity` coincident insertions. An explicit narrow counter that would
+overflow rejects the complete insertion with `OverflowError` before state changes.
 
 ## Examples
 
@@ -271,6 +308,33 @@ ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWT
 - `count`: Total elements added
 - `error_rate`: Target error rate
 - `filters`: List of internal `BloomFilter` instances
+
+### CountingBloomFilter
+
+**Constructor:**
+```python
+CountingBloomFilter(capacity, error_rate=0.001, counter_bits=None,
+                    credential_capacity=None)
+```
+- `capacity`: Nominal filter capacity and default active-credential limit
+- `error_rate`: False positive probability (0 < error_rate < 1)
+- `counter_bits`: Explicit counter width; one of 8, 16, 32, or 64 bits
+- `credential_capacity`: Maximum number of simultaneously revocable insertions
+
+**Methods:**
+- `add(key)` / `insert(key)`: Insert and return an opaque credential
+- `revoke(credential)`: Consume one live credential and decrement its counters
+- `tofile(f)` / `fromfile(f, n=-1)`: Persist or restore counters and credentials
+- `copy()`: Copy state; the replica accepts the same live credentials
+
+**Properties:**
+- `active_credential_count`: Current live credential count
+- `credential_capacity`: Maximum active credential table size
+- `counter_bits`: Counter width
+- `counter_persistent_size_bytes`: Serialized counter-array size
+- `credential_persistent_size_bytes`: Serialized size of active records
+- `credential_capacity_persistent_size_bytes`: Maximum serialized table size
+- `persistent_size_bytes`: Exact complete serialized size
 
 ## Hash Functions
 

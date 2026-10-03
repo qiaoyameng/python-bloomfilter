@@ -1,12 +1,13 @@
-"""Bloom Filter and Scalable Bloom Filter implementations.
+"""Bloom, Counting Bloom, and Scalable Bloom Filter implementations.
 
-This module implements two probabilistic data structures for space-efficient
+This module implements three probabilistic data structures for space-efficient
 set membership testing:
 
 1. BloomFilter: Fixed-capacity filter for known dataset sizes
-2. ScalableBloomFilter: Dynamically growing filter that scales automatically
+2. CountingBloomFilter: Credential-based filter supporting individual deletion
+3. ScalableBloomFilter: Dynamically growing filter that scales automatically
 
-Both implementations maintain a configurable false positive rate while never
+All implementations maintain a configurable false positive rate while never
 producing false negatives. The module uses optimized hash functions (xxHash
 for speed) and efficient bit array storage.
 
@@ -20,9 +21,12 @@ Requirements:
     - bitarray >= 0.3.4: Efficient bit array operations
     - xxhash >= 3.0.0: Fast non-cryptographic hashing
 """
+import array
 import copy
 import hashlib
 import math
+import secrets
+import sys
 from io import BytesIO
 from struct import calcsize, pack, unpack
 
@@ -609,6 +613,368 @@ class BloomFilter:
         self.__dict__.update(d)
         # Reconstruct hash function generator
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+
+
+class CountingBloomFilter(BloomFilter):
+    """A Bloom filter that supports revocation of individual insertions.
+
+    Each bit of a normal Bloom filter is replaced by an unsigned counter.
+    ``add`` returns an opaque one-use capability credential for that particular
+    insertion. The bounded active credential table records a hash of the
+    credential, its generation, and counter positions, so ``revoke`` never
+    derives a deletion from a key lookup.
+
+    The default counter width is selected from 8, 16, 32, and 64 bits so that
+    all positions can represent at least ``credential_capacity`` coincident
+    insertions. An explicitly narrow counter rejects an insertion before any
+    state changes if any affected counter is already at its maximum.
+    """
+
+    MAGIC = b'CBF1'
+    CREDENTIAL_VERSION = 1
+    _COUNTER_TYPECODES = {8: 'B', 16: 'H', 32: 'I', 64: 'Q'}
+    _HEADER_FMT = '<4sQQQQdQBB16s'
+
+    def __init__(self, capacity, error_rate=0.001, counter_bits=None,
+                 credential_capacity=None):
+        if not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("Capacity must be > 0")
+        if capacity >= (1 << 64):
+            raise ValueError("Capacity must fit in 64 bits")
+        if not (0 < error_rate < 1):
+            raise ValueError("Error_Rate must be between 0 and 1.")
+        if credential_capacity is None:
+            credential_capacity = capacity
+        if not isinstance(credential_capacity, int) or credential_capacity <= 0:
+            raise ValueError("Credential capacity must be > 0")
+        if credential_capacity >= (1 << 64):
+            raise ValueError("Credential capacity must fit in 64 bits")
+        if counter_bits is None:
+            required_capacity = max(capacity, credential_capacity)
+            for bits in (8, 16, 32, 64):
+                if (1 << bits) >= required_capacity:
+                    counter_bits = bits
+                    break
+            else:
+                raise ValueError("Counter width must be 8, 16, 32, or 64 bits")
+        if counter_bits not in self._COUNTER_TYPECODES:
+            raise ValueError("Counter width must be 8, 16, 32, or 64 bits")
+
+        num_slices = int(math.ceil(math.log(1.0 / error_rate, 2)))
+        bits_per_slice = int(math.ceil(
+            (capacity * abs(math.log(error_rate))) /
+            (num_slices * (math.log(2) ** 2))))
+        self._setup(error_rate, num_slices, bits_per_slice, capacity, 0,
+                    counter_bits, credential_capacity)
+
+    def _setup(self, error_rate, num_slices, bits_per_slice, capacity, count,
+               counter_bits=16, credential_capacity=None,
+               _generation=None):
+        super()._setup(error_rate, num_slices, bits_per_slice, capacity, count)
+        if credential_capacity is None:
+            credential_capacity = capacity
+        self.counter_bits = counter_bits
+        self.counter_max = (1 << counter_bits) - 1
+        self._counter_typecode = self._COUNTER_TYPECODES[counter_bits]
+        self._counter_item_size = array.array(self._counter_typecode).itemsize
+        if self._counter_item_size != counter_bits // 8:
+            raise ValueError('Unsupported native counter width on this platform')
+        self.counters = array.array(
+            self._counter_typecode, [0]) * self.num_bits
+        self.credential_capacity = credential_capacity
+        self.generation = _generation or secrets.token_bytes(16)
+        self._active_credentials = {}
+
+    @property
+    def active_credential_count(self):
+        """Number of insertions that can currently be revoked."""
+        return len(self._active_credentials)
+
+    @property
+    def counter_persistent_size_bytes(self):
+        """Persistent size of the counter array, in bytes."""
+        return self.num_bits * self._counter_item_size
+
+    @property
+    def _position_format(self):
+        if self.num_bits < (1 << 16):
+            return 'H'
+        if self.num_bits < (1 << 32):
+            return 'I'
+        return 'Q'
+
+    @property
+    def _position_size(self):
+        return calcsize('<' + self._position_format)
+
+    @property
+    def credential_record_persistent_size_bytes(self):
+        """Persistent size of one active credential record, in bytes."""
+        return 32 + 16 + 8 + (self.num_slices * self._position_size)
+
+    @property
+    def credential_persistent_size_bytes(self):
+        """Current persistent size of the bounded active credential table."""
+        return (self.active_credential_count *
+                self.credential_record_persistent_size_bytes)
+
+    @property
+    def credential_capacity_persistent_size_bytes(self):
+        """Persistent table size if every credential slot were active."""
+        return (self.credential_capacity *
+                self.credential_record_persistent_size_bytes)
+
+    @property
+    def persistent_size_bytes(self):
+        """Exact number of bytes written by :meth:`tofile`."""
+        return (calcsize(self._HEADER_FMT) +
+                self.counter_persistent_size_bytes +
+                self.credential_persistent_size_bytes)
+
+    def _positions_for(self, key):
+        positions = []
+        offset = 0
+        for position in self.make_hashes(key):
+            positions.append(offset + position)
+            offset += self.bits_per_slice
+        return tuple(positions)
+
+    def _make_credential(self, nonce, positions):
+        return (
+            pack('<B', self.CREDENTIAL_VERSION) +
+            self.generation +
+            nonce +
+            pack('<' + self._position_format * self.num_slices, *positions)
+        )
+
+    @staticmethod
+    def _credential_id(nonce):
+        return hashlib.sha256(nonce).digest()
+
+    def __contains__(self, key):
+        return all(self.counters[position] > 0
+                   for position in self._positions_for(key))
+
+    def __len__(self):
+        return self.active_credential_count
+
+    def add(self, key):
+        """Insert ``key`` and return an opaque one-use revocation credential."""
+        if self.active_credential_count >= self.credential_capacity:
+            raise IndexError(
+                "CountingBloomFilter active credential table is at capacity")
+
+        positions = self._positions_for(key)
+        if any(self.counters[position] >= self.counter_max
+               for position in positions):
+            raise OverflowError("CountingBloomFilter counter overflow")
+
+        nonce = secrets.token_bytes(16)
+        credential_id = self._credential_id(nonce)
+        while credential_id in self._active_credentials:
+            nonce = secrets.token_bytes(16)
+            credential_id = self._credential_id(nonce)
+        credential = self._make_credential(nonce, positions)
+
+        self._active_credentials[credential_id] = (self.generation, positions)
+        for position in positions:
+            self.counters[position] += 1
+        self.count = self.active_credential_count
+        return credential
+
+    insert = add
+
+    def revoke(self, credential):
+        """Revoke exactly the insertion represented by ``credential``.
+
+        Returns ``True`` only when this call validates and consumes a live
+        credential. Forged, foreign, malformed, generation-mismatched, or
+        already-revoked credentials return ``False`` without changing state.
+        """
+        position_format = '<' + self._position_format * self.num_slices
+        expected_size = 1 + 16 + 16 + calcsize(position_format)
+        if not isinstance(credential, bytes) or len(credential) != expected_size:
+            return False
+
+        version = credential[0]
+        generation = credential[1:17]
+        nonce = credential[17:33]
+        credential_id = self._credential_id(nonce)
+        positions = tuple(unpack(position_format, credential[33:expected_size]))
+
+        if version != self.CREDENTIAL_VERSION or generation != self.generation:
+            return False
+        record = self._active_credentials.get(credential_id)
+        if record is None or record != (self.generation, positions):
+            return False
+        if any(self.counters[position] == 0 for position in positions):
+            raise RuntimeError("CountingBloomFilter counters are inconsistent")
+
+        del self._active_credentials[credential_id]
+        for position in positions:
+            self.counters[position] -= 1
+        self.count = self.active_credential_count
+        return True
+
+    def copy(self):
+        """Return an independent replica with equivalent live credentials."""
+        replica = object.__new__(type(self))
+        replica._setup(self.error_rate, self.num_slices, self.bits_per_slice,
+                       self.capacity, self.count, self.counter_bits,
+                       self.credential_capacity, self.generation)
+        replica.counters = array.array(
+            self._counter_typecode, self.counters)
+        replica._active_credentials = {
+            credential_id: (generation, tuple(positions))
+            for credential_id, (generation, positions)
+            in self._active_credentials.items()
+        }
+        return replica
+
+    def union(self, other):
+        """Unsupported: unions cannot reconcile one-use credential ownership."""
+        raise TypeError('CountingBloomFilter does not support union')
+
+    def intersection(self, other):
+        """Unsupported: intersection cannot preserve credential ownership."""
+        raise TypeError('CountingBloomFilter does not support intersection')
+
+    @staticmethod
+    def _read_exactly(f, size):
+        data = f.read(size)
+        if len(data) != size:
+            raise EOFError("Unexpected end of CountingBloomFilter data")
+        return data
+
+    def _counter_bytes(self):
+        counters = self.counters
+        swapped = False
+        if sys.byteorder != 'little':
+            counters.byteswap()
+            swapped = True
+        try:
+            return counters.tobytes()
+        finally:
+            if swapped:
+                counters.byteswap()
+
+    def tofile(self, f):
+        """Serialize counters and all live credentials to a binary stream."""
+        header = pack(
+            self._HEADER_FMT,
+            self.MAGIC,
+            self.num_slices,
+            self.bits_per_slice,
+            self.capacity,
+            self.credential_capacity,
+            self.error_rate,
+            self.active_credential_count,
+            self.counter_bits,
+            0,
+            self.generation,
+        )
+        f.write(header)
+        f.write(self._counter_bytes())
+        position_format = '<' + self._position_format * self.num_slices
+        for credential_id, (generation, positions) in self._active_credentials.items():
+            record = credential_id + generation + pack('<Q', self.num_slices)
+            record += pack(position_format, *positions)
+            f.write(record)
+
+    @classmethod
+    def fromfile(cls, f, n=-1):
+        """Restore counters and credential validity from a binary stream."""
+        header_size = calcsize(cls._HEADER_FMT)
+        if 0 < n < header_size:
+            raise ValueError('n too small!')
+
+        header = cls._read_exactly(f, header_size)
+        (magic, num_slices, bits_per_slice, capacity, credential_capacity,
+         error_rate, active_count, counter_bits, _reserved, generation
+         ) = unpack(cls._HEADER_FMT, header)
+        if magic != cls.MAGIC or _reserved != 0:
+            raise ValueError('Invalid CountingBloomFilter header')
+        if counter_bits not in cls._COUNTER_TYPECODES:
+            raise ValueError('Invalid counter width')
+        if not (0 < error_rate < 1):
+            raise ValueError('Invalid error rate')
+        if num_slices == 0 or bits_per_slice == 0 or capacity == 0:
+            raise ValueError('Invalid CountingBloomFilter dimensions')
+        if credential_capacity == 0 or active_count > credential_capacity:
+            raise ValueError('Invalid active credential capacity')
+        expected_slices = int(math.ceil(math.log(1.0 / error_rate, 2)))
+        expected_bits_per_slice = int(math.ceil(
+            (capacity * abs(math.log(error_rate))) /
+            (num_slices * (math.log(2) ** 2))))
+        if (num_slices != expected_slices or
+                bits_per_slice != expected_bits_per_slice):
+            raise ValueError('CountingBloomFilter dimensions do not match parameters')
+
+        restored = object.__new__(cls)
+        restored._setup(error_rate, num_slices, bits_per_slice, capacity, 0,
+                        counter_bits, credential_capacity, generation)
+        counter_size = restored.counter_persistent_size_bytes
+        record_size = restored.credential_record_persistent_size_bytes
+        expected_total = header_size + counter_size + active_count * record_size
+        if 0 < n and n != expected_total:
+            raise ValueError('n does not match CountingBloomFilter size')
+
+        counter_bytes = cls._read_exactly(f, counter_size)
+        restored.counters = array.array(restored._counter_typecode)
+        restored.counters.frombytes(counter_bytes)
+        if sys.byteorder != 'little':
+            restored.counters.byteswap()
+
+        position_format = '<' + restored._position_format * num_slices
+        for _ in range(active_count):
+            record = cls._read_exactly(f, record_size)
+            credential_id = record[:32]
+            credential_generation = record[32:48]
+            stored_slice_count = unpack('<Q', record[48:56])[0]
+            if stored_slice_count != num_slices:
+                raise ValueError('Credential position count mismatch')
+            positions = tuple(unpack(position_format, record[56:]))
+            if credential_generation != generation:
+                raise ValueError('Credential generation mismatch')
+            if any(position >= restored.num_bits for position in positions):
+                raise ValueError('Credential counter position out of range')
+            if credential_id in restored._active_credentials:
+                raise ValueError('Duplicate active credential')
+            restored._active_credentials[credential_id] = (generation, positions)
+
+        restored.count = active_count
+        if len(restored.counters) != restored.num_bits:
+            raise ValueError('Counter length mismatch!')
+        if len(restored._active_credentials) > credential_capacity:
+            raise ValueError('Active credential table exceeds capacity')
+        required_counters = [0] * restored.num_bits
+        for _, positions in restored._active_credentials.values():
+            if len(set(positions)) != num_slices:
+                raise ValueError('Credential has duplicate counter positions')
+            for index, position in enumerate(positions):
+                if position // bits_per_slice != index:
+                    raise ValueError('Credential position belongs to wrong slice')
+                required_counters[position] += 1
+        if any(value > restored.counter_max for value in required_counters):
+            raise ValueError('Active credentials exceed counter width')
+        if restored.counters.tolist() != required_counters:
+            raise ValueError('Counter values do not match active credentials')
+        if n < 0 and f.read(1):
+            raise ValueError('Unexpected trailing CountingBloomFilter data')
+        return restored
+
+    def __getstate__(self):
+        d = super().__getstate__()
+        d['_active_credentials'] = {
+            credential_id: (generation, tuple(positions))
+            for credential_id, (generation, positions)
+            in d['_active_credentials'].items()
+        }
+        return d
+
+    def __setstate__(self, d):
+        super().__setstate__(d)
+        self._counter_item_size = array.array(self._counter_typecode).itemsize
 
 
 class ScalableBloomFilter:
