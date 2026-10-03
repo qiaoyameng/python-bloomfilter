@@ -171,6 +171,46 @@ print(15 in f_intersect)  # True (in both)
 print(25 in f_intersect)  # False (only in f2)
 ```
 
+### Estimating Cardinality, Union, and Overlap
+
+`len()` only counts `add()` calls. To estimate the number of *distinct*
+elements from the bitmap itself, and to compare two filters built with
+identical parameters, use the statistical estimation API:
+
+```python
+import pybloom_live
+
+f1 = pybloom_live.BloomFilter(capacity=1000, error_rate=0.01)
+f2 = pybloom_live.BloomFilter(capacity=1000, error_rate=0.01)
+for i in range(300):
+    f1.add(i)
+for i in range(100, 400):
+    f2.add(i)
+
+est = f1.estimate_cardinality()
+print(est.estimate, est.lower, est.upper)  # ~300 with uncertainty bounds
+
+print(f1.estimate_union_cardinality(f2).estimate)        # ~400
+print(f1.estimate_intersection_cardinality(f2).estimate) # ~200
+print(f1.estimate_jaccard(f2).estimate)                  # ~0.5
+```
+
+Each method returns an `EstimateResult` with a point `estimate`, `lower` /
+`upper` uncertainty bounds, a `std_error`, an `estimable` flag, and a
+`note` describing the method. Cardinality is inferred from the per-slice
+bit occupancy via the maximum-likelihood estimator
+`n = m * ln(m / (m - x))` averaged over all hash slices; the union merges
+the bitmaps (without modifying either filter) and applies the same
+estimator; the intersection uses inclusion-exclusion on those estimates —
+the bitwise-AND bitmap is *not* treated as an exact set, since it contains
+false-positive bit collisions.
+
+Estimates are probabilistic: hash-function correlation and the finite
+number of bits add error that grows as the bitmap fills. An empty filter
+yields exactly 0; a saturated (all-ones) filter cannot be estimated and
+reports `estimable=False` with only a lower bound. Comparing filters with
+different hash parameters raises `ValueError`.
+
 ### Example 3: Serialization
 
 Save and load filters from disk:

@@ -13,13 +13,19 @@ Test Coverage:
 - ScalableBloomFilter scaling behavior
 """
 import io
+import math
 import pickle
 import random
 import tempfile
 
 import pytest
 
-from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+from pybloom_live.pybloom import (
+    BloomFilter,
+    EstimateResult,
+    ScalableBloomFilter,
+    make_hashfuncs,
+)
 
 
 # =============================================================================
@@ -1137,6 +1143,208 @@ class TestEdgeCases:
         large_string = "x" * 10000
         bf.add(large_string)
         assert large_string in bf
+
+
+class TestCardinalityEstimates:
+    """Tests for the statistical estimation interface.
+
+    Covers estimate_cardinality, estimate_union_cardinality,
+    estimate_intersection_cardinality, and estimate_jaccard, using both
+    fixed-seed random sets with known overlap and synthetic bitmaps with
+    exactly known set-bit counts.
+    """
+
+    @staticmethod
+    def _known_overlap_filters(overlap=100, only_a=200, only_b=200,
+                               capacity=2000, error_rate=0.001, seed=42):
+        """Build two filters from fixed-seed sets with known overlap."""
+        rng = random.Random(seed)
+        shared = ['shared-%d' % i for i in range(overlap)]
+        unique_a = ['only-a-%d' % i for i in range(only_a)]
+        unique_b = ['only-b-%d' % i for i in range(only_b)]
+        rng.shuffle(shared)
+        rng.shuffle(unique_a)
+        rng.shuffle(unique_b)
+        bf_a = BloomFilter(capacity=capacity, error_rate=error_rate)
+        bf_b = BloomFilter(capacity=capacity, error_rate=error_rate)
+        for key in shared + unique_a:
+            bf_a.add(key)
+        for key in shared + unique_b:
+            bf_b.add(key)
+        return bf_a, bf_b
+
+    def test_known_overlap_direction_and_range(self):
+        """Fixed-seed sets: estimates land near the true values.
+
+        True values: |A| = |B| = 300, |A ∪ B| = 500, |A ∩ B| = 100,
+        Jaccard = 0.2.
+        """
+        bf_a, bf_b = self._known_overlap_filters()
+
+        est_a = bf_a.estimate_cardinality()
+        est_b = bf_b.estimate_cardinality()
+        est_u = bf_a.estimate_union_cardinality(bf_b)
+        est_i = bf_a.estimate_intersection_cardinality(bf_b)
+        est_j = bf_a.estimate_jaccard(bf_b)
+
+        for res in (est_a, est_b, est_u, est_i, est_j):
+            assert isinstance(res, EstimateResult)
+            assert res.estimable
+
+        # Direction and reasonable ranges around the true values.
+        assert 250 < est_a.estimate < 350
+        assert 250 < est_b.estimate < 350
+        assert 450 < est_u.estimate < 550
+        assert 40 < est_i.estimate < 170
+        assert 0.10 < est_j.estimate < 0.32
+
+        # Union must dominate both inputs; intersection must not exceed
+        # either input; Jaccard must stay in [0, 1].
+        assert est_u.estimate >= max(est_a.estimate, est_b.estimate)
+        assert est_i.estimate <= min(est_a.estimate, est_b.estimate)
+        assert 0.0 <= est_j.estimate <= 1.0
+
+        # Uncertainty intervals bracket the point estimates and the truth.
+        for res, truth in ((est_a, 300), (est_b, 300), (est_u, 500)):
+            assert res.lower <= res.estimate <= res.upper
+            assert res.lower <= truth <= res.upper
+            assert res.std_error >= 0
+
+    def test_disjoint_sets_intersection_near_zero(self):
+        """Disjoint fixed-seed sets: intersection estimate stays small."""
+        bf_a, bf_b = self._known_overlap_filters(overlap=0, only_a=300,
+                                                 only_b=300)
+        est_i = bf_a.estimate_intersection_cardinality(bf_b)
+        est_j = bf_a.estimate_jaccard(bf_b)
+        assert est_i.estimate >= 0.0
+        assert est_i.estimate < 30
+        assert est_j.estimate < 0.1
+
+    def test_empty_filter_exact_zero(self):
+        """An empty bitmap yields exactly zero, not an estimate."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        res = bf.estimate_cardinality()
+        assert res.estimable
+        assert res.estimate == 0.0
+        assert res.lower == 0.0
+        assert res.upper == 0.0
+
+    def test_empty_filters_jaccard_is_one(self):
+        """Two empty filters are identical by convention."""
+        bf_a = BloomFilter(capacity=100, error_rate=0.01)
+        bf_b = BloomFilter(capacity=100, error_rate=0.01)
+        res = bf_a.estimate_jaccard(bf_b)
+        assert res.estimable
+        assert res.estimate == 1.0
+
+    def test_synthetic_bitmap_matches_formula(self):
+        """Synthetic bitmap: estimate equals the closed-form MLE exactly.
+
+        Setting exactly x bits in every slice makes all per-slice
+        estimates identical, so the mean is m * ln(m / (m - x)) and the
+        standard error is zero.
+        """
+        bf = BloomFilter(capacity=1000, error_rate=0.01)
+        m = bf.bits_per_slice
+        x = 100
+        for offset in range(0, bf.num_bits, m):
+            bf.bitarray[offset:offset + x] = True
+
+        res = bf.estimate_cardinality()
+        expected = m * math.log(m / (m - x))
+        assert res.estimable
+        assert res.estimate == pytest.approx(expected, rel=1e-12)
+        assert res.std_error == pytest.approx(0.0, abs=1e-12)
+        assert res.lower <= res.estimate <= res.upper
+
+    def test_synthetic_bitmap_union_formula(self):
+        """Union of synthetic bitmaps follows the formula on merged bits."""
+        bf_a = BloomFilter(capacity=1000, error_rate=0.01)
+        bf_b = BloomFilter(capacity=1000, error_rate=0.01)
+        m = bf_a.bits_per_slice
+        # Disjoint synthetic bits: 100 per slice in A, 50 per slice in B.
+        for offset in range(0, bf_a.num_bits, m):
+            bf_a.bitarray[offset:offset + 100] = True
+            bf_b.bitarray[offset + 100:offset + 150] = True
+
+        res = bf_a.estimate_union_cardinality(bf_b)
+        expected = m * math.log(m / (m - 150))
+        assert res.estimate == pytest.approx(expected, rel=1e-12)
+
+    def test_saturated_bitmap_not_estimable(self):
+        """A fully set bitmap reports an inestimable state, not a number."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        bf.bitarray.setall(True)
+
+        res = bf.estimate_cardinality()
+        assert not res.estimable
+        assert res.estimate == math.inf
+        assert res.upper == math.inf
+        assert res.lower > 0  # lower bound remains finite and positive
+
+        bf_other = BloomFilter(capacity=100, error_rate=0.01)
+        bf_other.add('x')
+        assert not bf.estimate_union_cardinality(bf_other).estimable
+        assert not bf.estimate_intersection_cardinality(bf_other).estimable
+        jaccard = bf.estimate_jaccard(bf_other)
+        assert not jaccard.estimable
+        assert math.isnan(jaccard.estimate)
+
+    def test_identical_filters(self):
+        """Identical filters: intersection ≈ union ≈ cardinality, J ≈ 1."""
+        bf_a, _ = self._known_overlap_filters()
+        bf_copy = bf_a.copy()
+
+        est_i = bf_a.estimate_intersection_cardinality(bf_copy)
+        est_u = bf_a.estimate_union_cardinality(bf_copy)
+        est_j = bf_a.estimate_jaccard(bf_copy)
+        est_a = bf_a.estimate_cardinality()
+
+        assert est_i.estimate == pytest.approx(est_a.estimate, rel=1e-9)
+        assert est_u.estimate == pytest.approx(est_a.estimate, rel=1e-9)
+        assert est_j.estimate == pytest.approx(1.0, abs=1e-9)
+
+    def test_estimates_never_negative(self):
+        """No estimate or bound may be negative, even when clamped."""
+        bf_a, bf_b = self._known_overlap_filters(overlap=0, only_a=50,
+                                                 only_b=50)
+        for res in (bf_a.estimate_cardinality(),
+                    bf_a.estimate_union_cardinality(bf_b),
+                    bf_a.estimate_intersection_cardinality(bf_b),
+                    bf_a.estimate_jaccard(bf_b)):
+            assert res.estimate >= 0.0
+            assert res.lower >= 0.0
+            assert res.upper >= 0.0
+
+    def test_incompatible_filters_raise(self):
+        """Mismatched hash parameters or types are rejected up front."""
+        bf_a = BloomFilter(capacity=100, error_rate=0.01)
+        bf_b = BloomFilter(capacity=1000, error_rate=0.01)
+        with pytest.raises(ValueError):
+            bf_a.estimate_union_cardinality(bf_b)
+        with pytest.raises(ValueError):
+            bf_a.estimate_intersection_cardinality(bf_b)
+        with pytest.raises(ValueError):
+            bf_a.estimate_jaccard(bf_b)
+        with pytest.raises(TypeError):
+            bf_a.estimate_jaccard('not a filter')
+
+    def test_statistics_do_not_modify_filters(self):
+        """Estimation must be side-effect free on both operands."""
+        bf_a, bf_b = self._known_overlap_filters()
+        bits_a = bf_a.bitarray.copy()
+        bits_b = bf_b.bitarray.copy()
+        count_a, count_b = bf_a.count, bf_b.count
+
+        bf_a.estimate_cardinality()
+        bf_a.estimate_union_cardinality(bf_b)
+        bf_a.estimate_intersection_cardinality(bf_b)
+        bf_a.estimate_jaccard(bf_b)
+
+        assert bf_a.bitarray == bits_a
+        assert bf_b.bitarray == bits_b
+        assert bf_a.count == count_a
+        assert bf_b.count == count_b
 
 
 if __name__ == '__main__':
