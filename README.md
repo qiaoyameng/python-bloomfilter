@@ -21,6 +21,7 @@ A Bloom filter is a space-efficient probabilistic data structure that is used to
 - **Two implementations:**
   - `BloomFilter`: Fixed-capacity filter for known dataset sizes
   - `ScalableBloomFilter`: Automatically grows to accommodate more elements
+  - `BoundedScalableBloomFilter`: Scalable filter with a strict total false-positive budget shared by all layers
 
 - **High performance:** Uses xxHash for 128-bit hashing - one of the fastest non-cryptographic hash functions available
 
@@ -110,6 +111,36 @@ print(10000 in sbf)  # False
 **Growth modes:**
 - `SMALL_SET_GROWTH = 2`: Slower growth, uses less memory
 - `LARGE_SET_GROWTH = 4`: Faster growth (default), better for large datasets
+
+### BoundedScalableBloomFilter
+
+The `BoundedScalableBloomFilter` treats `error_rate` as a hard upper bound on the
+*joint* false-positive probability of the whole filter group. Each new layer
+receives a decreasing budget from a geometric series
+(`p_i = error_rate * (1 - ratio) * ratio**i`, summing to `error_rate`), and each
+layer's capacity, hash count and bit count are derived from its own budget.
+Growth is triggered by actual bit occupancy rather than the (inexact) element
+count, unions re-estimate occupancy and refuse combinations that can no longer
+guarantee the total budget, and the serialized form records both the strategy
+and every layer's parameters:
+
+```python
+import pybloom_live
+
+sbf = pybloom_live.BoundedScalableBloomFilter(
+    initial_capacity=100,
+    error_rate=0.001,   # total budget for all current and future layers
+    mode=pybloom_live.BoundedScalableBloomFilter.LARGE_SET_GROWTH,
+    ratio=0.9,          # budget tightening ratio between layers
+)
+
+for i in range(10000):
+    sbf.add(i)
+
+print(sbf.error_bound)       # joint FP upper bound of existing layers (< 0.001)
+print(sbf.remaining_budget)  # budget still available for future layers
+print(sbf.estimated_count)   # occupancy-based estimate of element count
+```
 
 ## Examples
 
@@ -270,6 +301,37 @@ ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWT
 - `capacity`: Total capacity (sum of all internal filters)
 - `count`: Total elements added
 - `error_rate`: Target error rate
+- `filters`: List of internal `BloomFilter` instances
+
+### BoundedScalableBloomFilter
+
+**Constructor:**
+```python
+BoundedScalableBloomFilter(initial_capacity=100, error_rate=0.001,
+                           mode=LARGE_SET_GROWTH, ratio=0.9,
+                           saturation_threshold=0.5)
+```
+- `initial_capacity`: Capacity of the first layer (layer `i` gets `initial_capacity * mode**i`)
+- `error_rate`: Total false-positive budget shared by all layers
+- `mode`: Capacity growth factor between layers
+- `ratio`: Budget tightening ratio; layer `i` gets `error_rate * (1 - ratio) * ratio**i`
+- `saturation_threshold`: Bit fill fraction that triggers growth / rejects unions
+
+**Methods:**
+- `add(key)`: Add element, growing a new layer when the newest is saturated
+- `__contains__(key)`: Check membership (no false negatives)
+- `__len__()`: Total recorded additions across all layers
+- `union(other)`: Merge; re-estimates counts from bit occupancy and raises
+  `ValueError` if the total budget can no longer be guaranteed
+- `layer_budget(i)` / `layer_capacity(i)`: Budget and capacity allotted to layer `i`
+- `tofile(f)` / `fromfile(f)`: Serialization of strategy and all layer parameters
+
+**Properties:**
+- `error_bound`: Joint false-positive upper bound of the existing layers
+- `remaining_budget`: Budget still available for future layers
+- `estimated_count`: Occupancy-based estimate of the element count
+- `capacity`: Total capacity (sum of all layers)
+- `count`: Total recorded additions (not an exact deduplicated count)
 - `filters`: List of internal `BloomFilter` instances
 
 ## Hash Functions

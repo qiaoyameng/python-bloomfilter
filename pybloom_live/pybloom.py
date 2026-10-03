@@ -1002,6 +1002,380 @@ class ScalableBloomFilter:
         return sum(f.count for f in self.filters)
 
 
+class BoundedScalableBloomFilter:
+    """A scalable Bloom filter with a strict total false-positive budget.
+
+    Unlike :class:`ScalableBloomFilter`, which tightens each new layer's
+    error rate relative to the previous layer without a global contract,
+    this implementation treats the user-supplied ``error_rate`` as a hard
+    upper bound on the *joint* false-positive probability of the whole
+    filter group, no matter how many layers are added.
+
+    Budget Allocation:
+        Layer ``i`` (0-based) receives the budget::
+
+            p_i = error_rate * (1 - ratio) * ratio ** i
+
+        The budgets form a geometric series whose infinite sum is exactly
+        ``error_rate``, so the union bound over any number of layers never
+        exceeds the configured total::
+
+            P(false positive) <= sum(p_i for existing layers) < error_rate
+
+        Each layer's capacity, hash count and bit count are derived from
+        *its own* budget ``p_i`` (layers never share a single error rate)::
+
+            capacity_i = initial_capacity * scale ** i
+
+    Saturation Detection:
+        Growth is triggered by the *actual bit occupancy* of the newest
+        layer (``set_bits / num_bits >= saturation_threshold``), not by the
+        element count. The count kept by :class:`BloomFilter` is not an
+        exact deduplicated element count (false positives during the
+        duplicate check can suppress increments), so bit fill is the
+        authoritative saturation signal; the count is only used as a
+        defensive backstop.
+
+    Union Contract:
+        Merging two filters re-estimates each merged layer's occupancy
+        from its bits instead of trusting the pre-merge counts. If any
+        merged layer would be saturated beyond ``saturation_threshold``
+        (meaning its budget can no longer be guaranteed), the union is
+        refused with :class:`ValueError` rather than silently returning a
+        filter that violates the total budget.
+
+    Persistence:
+        The file format stores the global strategy (scale, ratio, initial
+        capacity, total budget, saturation threshold) plus every layer's
+        full parameter set. After loading, growth continues the same
+        geometric budget series, and already-inserted keys keep their
+        original hashes because existing layers are restored bit-for-bit
+        and new layers are only ever appended.
+    """
+
+    SMALL_SET_GROWTH = 2
+    LARGE_SET_GROWTH = 4
+    MAGIC = b'BSBF'
+    FILE_FMT = b'<4sidQdd'
+
+    def __init__(self, initial_capacity=100, error_rate=0.001,
+                 mode=LARGE_SET_GROWTH, ratio=0.9, saturation_threshold=0.5):
+        """Initialize a budget-bounded scalable Bloom filter.
+
+        Args:
+            initial_capacity (int): Capacity of the first layer. Layer ``i``
+                has capacity ``initial_capacity * mode ** i``.
+            error_rate (float): Total false-positive budget shared by all
+                current and future layers. Must be in (0, 1).
+            mode (int): Capacity growth factor between consecutive layers.
+                Use SMALL_SET_GROWTH (2) or LARGE_SET_GROWTH (4), or any
+                integer >= 2.
+            ratio (float): Budget tightening ratio in (0, 1). Layer ``i``
+                receives ``error_rate * (1 - ratio) * ratio ** i``.
+            saturation_threshold (float): Bit fill fraction in (0, 1) at
+                which a layer is considered saturated. With optimally sized
+                layers the expected fill at capacity is ~0.5, so 0.5 grows
+                layers right around their nominal capacity.
+
+        Raises:
+            ValueError: If any parameter is outside its valid range.
+        """
+        if not (0 < error_rate < 1):
+            raise ValueError("error_rate must be between 0 and 1 (exclusive)")
+        if not (0 < ratio < 1):
+            raise ValueError("ratio must be between 0 and 1 (exclusive)")
+        if not isinstance(mode, int) or mode < 2:
+            raise ValueError("mode must be an integer >= 2")
+        if not initial_capacity > 0:
+            raise ValueError("initial_capacity must be > 0")
+        if not (0 < saturation_threshold < 1):
+            raise ValueError(
+                "saturation_threshold must be between 0 and 1 (exclusive)")
+        self._setup(mode, ratio, initial_capacity, error_rate,
+                    saturation_threshold)
+        self.filters = []
+
+    def _setup(self, mode, ratio, initial_capacity, error_rate,
+               saturation_threshold):
+        """Store the growth strategy (also used when deserializing)."""
+        self.scale = mode
+        self.ratio = ratio
+        self.initial_capacity = initial_capacity
+        self.error_rate = error_rate
+        self.saturation_threshold = saturation_threshold
+
+    def layer_budget(self, index):
+        """Return the false-positive budget allotted to layer ``index``.
+
+        The budgets form a geometric series summing to ``error_rate``::
+
+            p_i = error_rate * (1 - ratio) * ratio ** index
+
+        Args:
+            index (int): 0-based layer index.
+
+        Returns:
+            float: The maximum false-positive probability allowed for the
+                layer at ``index``.
+        """
+        return self.error_rate * (1.0 - self.ratio) * (self.ratio ** index)
+
+    def layer_capacity(self, index):
+        """Return the element capacity of layer ``index``.
+
+        Args:
+            index (int): 0-based layer index.
+
+        Returns:
+            int: ``initial_capacity * scale ** index``.
+        """
+        return self.initial_capacity * (self.scale ** index)
+
+    @property
+    def error_bound(self):
+        """Joint false-positive upper bound of the current layers.
+
+        This is the sum of the budgets of all existing layers. It is always
+        strictly less than the configured total ``error_rate`` and grows
+        towards it as layers are added.
+
+        Returns:
+            float: Upper bound on P(any layer returns a false positive).
+        """
+        return sum(self.layer_budget(i) for i in range(len(self.filters)))
+
+    @property
+    def remaining_budget(self):
+        """Budget still available for future layers.
+
+        Returns:
+            float: ``error_rate - error_bound``; always positive.
+        """
+        return self.error_rate - self.error_bound
+
+    @staticmethod
+    def _fill_ratio(filter):
+        """Return the fraction of set bits in a layer's bit array."""
+        if not filter.num_bits:
+            return 0.0
+        return filter.bitarray.count() / filter.num_bits
+
+    @staticmethod
+    def _estimate_count(filter):
+        """Estimate the number of elements in a layer from its bit fill.
+
+        Uses the standard estimator n ~ -(m / k) * ln(1 - X / m), where m is
+        the bit count, k the hash count and X the number of set bits. The
+        caller must ensure the layer is not saturated (fill < 1).
+        """
+        set_bits = filter.bitarray.count()
+        if set_bits == 0:
+            return 0
+        return -(filter.num_bits / filter.num_slices) * math.log(
+            1.0 - set_bits / filter.num_bits)
+
+    def _is_saturated(self, filter):
+        """Decide whether a layer may no longer meet its budget.
+
+        Primary signal is the actual bit occupancy; the (inexact) element
+        count is only a defensive backstop for the degenerate case where
+        the count reached capacity before the fill threshold did.
+        """
+        if self._fill_ratio(filter) >= self.saturation_threshold:
+            return True
+        return filter.count >= filter.capacity
+
+    def _grow(self):
+        """Append a new layer sized from the next budget in the series."""
+        index = len(self.filters)
+        self.filters.append(BloomFilter(
+            capacity=self.layer_capacity(index),
+            error_rate=self.layer_budget(index)))
+
+    def __contains__(self, key):
+        """Test whether an element is in the filter (no false negatives)."""
+        for f in reversed(self.filters):
+            if key in f:
+                return True
+        return False
+
+    def add(self, key):
+        """Add an element, growing a new layer when the newest is saturated.
+
+        Args:
+            key: The element to add.
+
+        Returns:
+            bool: True if the element was probably already present, False
+                if it is definitely new.
+        """
+        if key in self:
+            return True
+        if not self.filters or self._is_saturated(self.filters[-1]):
+            self._grow()
+        self.filters[-1].add(key, skip_check=True)
+        return False
+
+    def union(self, other):
+        """Union with another BoundedScalableBloomFilter.
+
+        Corresponding layers are merged with bitwise OR. Each merged layer
+        is then re-validated against the saturation threshold using its
+        actual bit occupancy, and its element count is re-estimated from
+        the bits (the pre-merge counts cannot be trusted after a merge
+        because overlaps are unknowable).
+
+        Args:
+            other (BoundedScalableBloomFilter): Filter with an identical
+                growth strategy (mode, ratio, initial_capacity, error_rate,
+                saturation_threshold).
+
+        Returns:
+            BoundedScalableBloomFilter: The merged filter.
+
+        Raises:
+            ValueError: If the strategies differ, or if any merged layer
+                would be saturated and the total error budget could no
+                longer be guaranteed.
+        """
+        if not isinstance(other, BoundedScalableBloomFilter):
+            raise ValueError(
+                "Can only union with another BoundedScalableBloomFilter")
+        if self.scale != other.scale or \
+                self.ratio != other.ratio or \
+                self.initial_capacity != other.initial_capacity or \
+                self.error_rate != other.error_rate or \
+                self.saturation_threshold != other.saturation_threshold:
+            raise ValueError(
+                "Unioning two bounded scalable bloom filters requires both "
+                "filters to have the same mode, ratio, initial capacity, "
+                "error rate and saturation threshold")
+
+        if len(self.filters) >= len(other.filters):
+            larger_sbf = copy.deepcopy(self)
+            smaller_sbf = other
+        else:
+            larger_sbf = copy.deepcopy(other)
+            smaller_sbf = self
+
+        new_filters = []
+        for i in range(len(smaller_sbf.filters)):
+            merged = larger_sbf.filters[i] | smaller_sbf.filters[i]
+            if self._fill_ratio(merged) >= self.saturation_threshold:
+                raise ValueError(
+                    "Union would oversaturate layer %d (fill %.3f >= "
+                    "threshold %.3f); the total error budget can no longer "
+                    "be guaranteed" % (
+                        i, self._fill_ratio(merged),
+                        self.saturation_threshold))
+            # Re-estimate the element count from the actual bits instead of
+            # reusing the pre-merge counts; round up to stay conservative.
+            merged.count = int(math.ceil(self._estimate_count(merged)))
+            new_filters.append(merged)
+
+        for i in range(len(smaller_sbf.filters), len(larger_sbf.filters)):
+            new_filters.append(larger_sbf.filters[i])
+
+        larger_sbf.filters = new_filters
+        return larger_sbf
+
+    def __or__(self, other):
+        """Implement the | operator for union."""
+        return self.union(other)
+
+    @property
+    def capacity(self):
+        """Total capacity across all existing layers."""
+        return sum(f.capacity for f in self.filters)
+
+    @property
+    def count(self):
+        """Total number of recorded additions across all layers.
+
+        Note:
+            This is not an exact deduplicated element count; use
+            :meth:`estimated_count` for an occupancy-based estimate.
+        """
+        return len(self)
+
+    @property
+    def estimated_count(self):
+        """Estimate of the element count derived from bit occupancy.
+
+        Returns:
+            float: Sum of per-layer estimates; more robust than ``count``
+                when duplicates or unions are involved.
+        """
+        return sum(self._estimate_count(f) for f in self.filters)
+
+    def __len__(self):
+        """Return the total recorded addition count across all layers."""
+        return sum(f.count for f in self.filters)
+
+    def tofile(self, f):
+        """Serialize the filter, its strategy and every layer to a file.
+
+        The header stores the magic tag, growth mode, tightening ratio,
+        initial capacity, total error budget and saturation threshold;
+        each layer is then written with its full parameter set (its own
+        error rate, hash count, bits per slice, capacity and count), so a
+        restored filter continues the same budget series and never rehashes
+        previously inserted keys.
+
+        Args:
+            f: File-like object opened in binary write mode ('wb').
+        """
+        f.write(pack(self.FILE_FMT, self.MAGIC, self.scale, self.ratio,
+                     self.initial_capacity, self.error_rate,
+                     self.saturation_threshold))
+        f.write(pack(b'<l', len(self.filters)))
+
+        if len(self.filters) > 0:
+            headerpos = f.tell()
+            headerfmt = b'<' + b'Q' * len(self.filters)
+            f.write(b'.' * calcsize(headerfmt))
+
+            filter_sizes = []
+            for filter in self.filters:
+                begin = f.tell()
+                filter.tofile(f)
+                filter_sizes.append(f.tell() - begin)
+
+            f.seek(headerpos)
+            f.write(pack(headerfmt, *filter_sizes))
+
+    @classmethod
+    def fromfile(cls, f):
+        """Deserialize a BoundedScalableBloomFilter written by tofile().
+
+        Args:
+            f: File-like object opened in binary read mode ('rb').
+
+        Returns:
+            BoundedScalableBloomFilter: The restored filter; further adds
+                continue the persisted budget series.
+
+        Raises:
+            ValueError: If the file does not start with the expected magic.
+        """
+        header = unpack(cls.FILE_FMT, f.read(calcsize(cls.FILE_FMT)))
+        magic, mode, ratio, initial_capacity, error_rate, threshold = header
+        if magic != cls.MAGIC:
+            raise ValueError(
+                'Not a BoundedScalableBloomFilter file (bad magic)')
+        filter = cls(initial_capacity=initial_capacity,
+                     error_rate=error_rate, mode=mode, ratio=ratio,
+                     saturation_threshold=threshold)
+
+        nfilters, = unpack(b'<l', f.read(calcsize(b'<l')))
+        if nfilters > 0:
+            header_fmt = b'<' + b'Q' * nfilters
+            filter_lengths = unpack(header_fmt, f.read(calcsize(header_fmt)))
+            for fl in filter_lengths:
+                filter.filters.append(BloomFilter.fromfile(f, fl))
+        return filter
+
+
 if __name__ == "__main__":
     import doctest
 
