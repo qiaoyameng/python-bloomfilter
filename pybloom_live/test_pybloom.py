@@ -19,7 +19,12 @@ import tempfile
 
 import pytest
 
-from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+from pybloom_live.pybloom import (
+    BloomFilter,
+    ScalableBloomFilter,
+    filter_parameters,
+    make_hashfuncs,
+)
 
 
 # =============================================================================
@@ -489,7 +494,7 @@ class TestBloomFilterSetOperations:
         bf1 = BloomFilter(capacity=100, error_rate=0.01)
         bf2 = BloomFilter(capacity=200, error_rate=0.01)
 
-        with pytest.raises(ValueError, match="same capacity and error rate"):
+        with pytest.raises(ValueError, match="identical dimensions and error rate"):
             bf1.union(bf2)
 
     def test_union_requires_matching_error_rate(self):
@@ -504,7 +509,7 @@ class TestBloomFilterSetOperations:
         bf1 = BloomFilter(capacity=100, error_rate=0.01)
         bf2 = BloomFilter(capacity=100, error_rate=0.001)
 
-        with pytest.raises(ValueError, match="same capacity and error rate"):
+        with pytest.raises(ValueError, match="identical dimensions and error rate"):
             bf1.union(bf2)
 
     def test_intersection_contains_common_elements(self):
@@ -987,34 +992,149 @@ class TestScalableBloomFilter:
         assert sbf.capacity == expected_capacity
 
     def test_union_scalable_filters(self):
-        """Test union of two ScalableBloomFilters.
-
-        Purpose:
-            Verify that ScalableBloomFilter union combines all elements.
-
-        Expected:
-            Union should contain elements from both filters.
-        """
+        """Test a union that can still satisfy the total error contract."""
         sbf1 = ScalableBloomFilter(
-            initial_capacity=10,
+            initial_capacity=1000,
             mode=ScalableBloomFilter.SMALL_SET_GROWTH
         )
         sbf2 = ScalableBloomFilter(
-            initial_capacity=10,
+            initial_capacity=1000,
             mode=ScalableBloomFilter.SMALL_SET_GROWTH
         )
 
-        # Add different ranges to each filter
-        for i in range(50):
+        for i in range(250):
             sbf1.add(i)
-        for i in range(50, 100):
+        for i in range(250, 500):
             sbf2.add(i)
 
-        # Union should have all elements
         sbf_union = sbf1 | sbf2
 
-        for i in range(100):
+        for i in range(500):
             assert i in sbf_union, f"Union should contain {i}"
+        assert sbf_union.error_upper_bound <= sbf_union.error_rate
+        assert sbf_union.filters[0].count == sbf_union.filters[0].estimated_count()
+
+    def test_union_rejects_oversaturated_combination(self):
+        """Reject a union when merged occupancy cannot keep the layer budget."""
+        sbf1 = ScalableBloomFilter(initial_capacity=1)
+        sbf2 = ScalableBloomFilter(initial_capacity=1)
+        sbf1.add("only-in-first")
+        sbf2.add("only-in-second")
+
+        with pytest.raises(ValueError, match="false-positive budget"):
+            sbf1 | sbf2
+
+    def test_layer_budgets_are_geometrically_decreasing(self):
+        """Layer dimensions and capacities come from each layer's own budget."""
+        target_error = 0.001
+        sbf = ScalableBloomFilter(
+            initial_capacity=1,
+            error_rate=target_error,
+            mode=ScalableBloomFilter.LARGE_SET_GROWTH,
+            ratio=0.9
+        )
+
+        inserted = 0
+        while len(sbf.filters) < 4:
+            sbf.add(f"key-{inserted}")
+            inserted += 1
+
+        expected_budgets = [
+            target_error * 0.1,
+            target_error * 0.1 * 0.9,
+            target_error * 0.1 * 0.9 ** 2,
+            target_error * 0.1 * 0.9 ** 3,
+        ]
+        expected_capacities = [1, 4, 16, 64]
+
+        assert sbf.layer_budgets == pytest.approx(expected_budgets)
+        for index, layer in enumerate(sbf.filters):
+            assert layer.error_rate == pytest.approx(expected_budgets[index])
+            assert layer.capacity == expected_capacities[index]
+            expected_k, expected_m = filter_parameters(
+                layer.capacity, layer.error_rate)
+            assert layer.num_slices == expected_k
+            assert layer.bits_per_slice == expected_m
+            assert layer.current_error_rate() <= layer.error_rate
+
+        for key in range(inserted):
+            assert f"key-{key}" in sbf
+        assert sbf.error_upper_bound <= target_error
+
+    def test_growth_uses_bit_occupancy_not_count(self):
+        """An inaccurate count alone must not trigger another layer."""
+        sbf = ScalableBloomFilter(initial_capacity=10)
+        sbf.add("first")
+        sbf.filters[-1].count = 10_000
+
+        sbf.add("second")
+
+        assert len(sbf.filters) == 1
+        assert sbf.filters[-1].current_error_rate() <= sbf.filters[-1].error_rate
+
+    def test_persistence_restores_policy_and_keeps_old_hashes(self):
+        """Persist every layer's parameters and continue growth after restore."""
+        original = ScalableBloomFilter(
+            initial_capacity=1,
+            error_rate=0.001,
+            mode=ScalableBloomFilter.LARGE_SET_GROWTH,
+            ratio=0.9
+        )
+        for i in range(20):
+            original.add(i)
+
+        with tempfile.TemporaryFile(mode='w+b') as f:
+            original.tofile(f)
+            f.seek(0)
+            restored = ScalableBloomFilter.fromfile(f)
+
+        old_hashes = [
+            tuple(restored.filters[0].make_hashes(i))
+            for i in range(5)
+        ]
+        restored_layers_before_add = len(restored.filters)
+        for i in range(20, 80):
+            restored.add(i)
+
+        assert restored.scale == original.scale
+        assert restored.ratio == original.ratio
+        assert restored.initial_capacity == original.initial_capacity
+        assert restored.error_rate == original.error_rate
+        assert len(restored.filters) > restored_layers_before_add
+        for index, layer in enumerate(original.filters):
+            restored_layer = restored.filters[index]
+            assert restored_layer.capacity == layer.capacity
+            assert restored_layer.error_rate == layer.error_rate
+            assert restored_layer.num_slices == layer.num_slices
+            assert restored_layer.bits_per_slice == layer.bits_per_slice
+
+        new_old_hashes = [
+            tuple(restored.filters[0].make_hashes(i))
+            for i in range(5)
+        ]
+        assert new_old_hashes == old_hashes
+        for i in range(80):
+            assert i in restored
+
+    def test_observed_false_positive_rate_is_supplementary(self):
+        """Empirical false positives supplement, but do not replace, the bound."""
+        sbf = ScalableBloomFilter(
+            initial_capacity=2,
+            error_rate=0.01,
+            mode=ScalableBloomFilter.SMALL_SET_GROWTH,
+            ratio=0.8
+        )
+        for i in range(300):
+            sbf.add(f"present-{i}")
+
+        for i in range(300):
+            assert f"present-{i}" in sbf
+        assert sbf.error_upper_bound <= sbf.error_rate
+
+        false_positives = sum(
+            f"absent-{i}" in sbf for i in range(3000)
+        )
+        assert false_positives / 3000 < 0.05
 
     def test_union_requires_matching_parameters(self):
         """Test that union validates matching parameters.
@@ -1028,7 +1148,7 @@ class TestScalableBloomFilter:
         sbf1 = ScalableBloomFilter(initial_capacity=100, error_rate=0.001)
         sbf2 = ScalableBloomFilter(initial_capacity=200, error_rate=0.001)
 
-        with pytest.raises(ValueError, match="same mode, initial capacity and error rate"):
+        with pytest.raises(ValueError, match="same mode, ratio, initial capacity and error rate"):
             sbf1.union(sbf2)
 
 

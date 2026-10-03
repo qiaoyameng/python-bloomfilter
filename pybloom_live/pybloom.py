@@ -20,7 +20,6 @@ Requirements:
     - bitarray >= 0.3.4: Efficient bit array operations
     - xxhash >= 3.0.0: Fast non-cryptographic hashing
 """
-import copy
 import hashlib
 import math
 from io import BytesIO
@@ -137,6 +136,22 @@ def make_hashfuncs(num_slices, num_bits):
     return _hash_maker, hashfn
 
 
+def filter_parameters(capacity, error_rate):
+    """Return conservative Bloom-filter dimensions for a layer budget."""
+    num_slices = int(math.ceil(math.log(1.0 / error_rate, 2)))
+    bits_per_slice = int(math.ceil(
+        (capacity * abs(math.log(error_rate))) /
+        (num_slices * (math.log(2) ** 2))))
+
+    while True:
+        occupancy = 1 - (1 - 1 / bits_per_slice) ** capacity
+        if occupancy ** num_slices <= error_rate:
+            break
+        bits_per_slice += 1
+
+    return num_slices, bits_per_slice
+
+
 class BloomFilter:
     FILE_FMT = b'<dQQQQ'
 
@@ -186,16 +201,7 @@ class BloomFilter:
         if not capacity > 0:
             raise ValueError("Capacity must be > 0")
 
-        # Calculate optimal number of hash functions (k)
-        # k = ceil(log2(1/P)) minimizes false positive rate
-        num_slices = int(math.ceil(math.log(1.0 / error_rate, 2)))
-
-        # Calculate optimal bits per slice (m)
-        # Derived from: n ≈ M × (ln(2)²) / |ln(P)|
-        # where M = k × m (total bits)
-        bits_per_slice = int(math.ceil(
-            (capacity * abs(math.log(error_rate))) /
-            (num_slices * (math.log(2) ** 2))))
+        num_slices, bits_per_slice = filter_parameters(capacity, error_rate)
 
         self._setup(error_rate, num_slices, bits_per_slice, capacity, 0)
         self.bitarray = bitarray.bitarray(self.num_bits, endian='little')
@@ -221,7 +227,49 @@ class BloomFilter:
         self.capacity = capacity
         self.num_bits = num_slices * bits_per_slice
         self.count = count
+        self.slice_set_counts = [0] * num_slices
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+
+    def _refresh_slice_set_counts(self):
+        """Recover occupied-bit counts from the persisted bit array."""
+        self.slice_set_counts = []
+        for index in range(self.num_slices):
+            start = index * self.bits_per_slice
+            stop = start + self.bits_per_slice
+            self.slice_set_counts.append(self.bitarray[start:stop].count(1))
+
+    def current_error_rate(self):
+        """Return the false-positive bound implied by actual bit occupancy."""
+        rate = 1.0
+        for set_count in self.slice_set_counts:
+            rate *= set_count / self.bits_per_slice
+        return rate
+
+    def projected_error_rate(self, hashes):
+        """Return the worst occupancy bound after setting one key's bits."""
+        rate = 1.0
+        for index, position in enumerate(hashes):
+            offset = index * self.bits_per_slice
+            set_count = self.slice_set_counts[index]
+            if not self.bitarray[offset + position]:
+                set_count += 1
+            rate *= set_count / self.bits_per_slice
+        return rate
+
+    def estimated_count(self):
+        """Estimate inserted keys from occupancy, without trusting count."""
+        estimates = []
+        for set_count in self.slice_set_counts:
+            occupancy = set_count / self.bits_per_slice
+            if occupancy == 0:
+                estimates.append(0.0)
+            elif occupancy == 1:
+                estimates.append(float('inf'))
+            else:
+                estimates.append(
+                    math.log(1 - occupancy) /
+                    math.log(1 - 1 / self.bits_per_slice))
+        return int(math.ceil(max(estimates))) if max(estimates) > 0 else 0
 
     def __contains__(self, key):
         """Test whether an element is in the Bloom filter.
@@ -331,24 +379,35 @@ class BloomFilter:
         # Cache attributes as local variables for faster loop access
         bitarray = self.bitarray
         bits_per_slice = self.bits_per_slice
-        hashes = self.make_hashes(key)
+        hashes = tuple(self.make_hashes(key))
+        if self.projected_error_rate(hashes) > self.error_rate:
+            raise IndexError("BloomFilter would exceed its false-positive budget")
 
         # Optimized path for skip_check=True (bulk insertions)
         if skip_check:
+            changed = False
             offset = 0
-            for k in hashes:
-                bitarray[offset + k] = True
+            for index, k in enumerate(hashes):
+                position = offset + k
+                if not bitarray[position]:
+                    self.slice_set_counts[index] += 1
+                    changed = True
+                bitarray[position] = True
                 offset += bits_per_slice
-            self.count += 1
+            if changed:
+                self.count += 1
             return False
 
         # Check for duplicate and set bits in single pass
         found_all_bits = True
         offset = 0
-        for k in hashes:
+        for index, k in enumerate(hashes):
+            position = offset + k
             if found_all_bits and not bitarray[offset + k]:
                 found_all_bits = False  # Found at least one unset bit
-            bitarray[offset + k] = True
+            if not bitarray[position]:
+                self.slice_set_counts[index] += 1
+            bitarray[position] = True
             offset += bits_per_slice
 
         # Only increment count if this is a new element
@@ -380,9 +439,11 @@ class BloomFilter:
             >>> "banana" in bf2
             True
         """
-        new_filter = BloomFilter(self.capacity, self.error_rate)
+        new_filter = BloomFilter.__new__(BloomFilter)
+        new_filter._setup(self.error_rate, self.num_slices,
+                          self.bits_per_slice, self.capacity, self.count)
         new_filter.bitarray = self.bitarray.copy()
-        new_filter.count = self.count  # Preserve count
+        new_filter._refresh_slice_set_counts()
         return new_filter
 
     def union(self, other):
@@ -418,12 +479,18 @@ class BloomFilter:
             The count in the resulting filter may not be accurate as it cannot
             account for elements present in both filters.
         """
-        if self.capacity != other.capacity or self.error_rate != other.error_rate:
+        if self.capacity != other.capacity or \
+                self.error_rate != other.error_rate or \
+                self.num_slices != other.num_slices or \
+                self.bits_per_slice != other.bits_per_slice:
             raise ValueError(
-                "Unioning filters requires both filters to have both the same capacity and error rate")
+                "Unioning filters requires identical dimensions and error rate")
         new_bloom = self.copy()
         new_bloom.bitarray = new_bloom.bitarray | other.bitarray
-        # Note: Count is not accurately updated as we can't determine overlaps
+        new_bloom._refresh_slice_set_counts()
+        if new_bloom.current_error_rate() > self.error_rate:
+            raise ValueError("Union would exceed the filter's false-positive budget")
+        new_bloom.count = new_bloom.estimated_count()
         return new_bloom
 
     def __or__(self, other):
@@ -476,7 +543,7 @@ class BloomFilter:
                 "Intersecting filters requires both filters to have equal capacity and error rate")
         new_bloom = self.copy()
         new_bloom.bitarray = new_bloom.bitarray & other.bitarray
-        # Note: Count is not accurately updated for intersections
+        new_bloom._refresh_slice_set_counts()
         return new_bloom
 
     def __and__(self, other):
@@ -581,6 +648,7 @@ class BloomFilter:
         if filter.num_bits != len(filter.bitarray) and \
                 (filter.num_bits + (8 - filter.num_bits % 8) != len(filter.bitarray)):
             raise ValueError('Bit length mismatch!')
+        filter._refresh_slice_set_counts()
 
         return filter
 
@@ -609,87 +677,93 @@ class BloomFilter:
         self.__dict__.update(d)
         # Reconstruct hash function generator
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        if not hasattr(self, 'slice_set_counts'):
+            self._refresh_slice_set_counts()
 
 
 class ScalableBloomFilter:
-    """A Bloom filter that automatically scales as more elements are added.
+    """A scalable Bloom filter with a joint false-positive upper bound.
 
-    This implementation follows the algorithm described in:
-    "Scalable Bloom Filters" by Almeida et al., GLOBECOM 2007.
-
-    The filter automatically creates additional internal Bloom filters as
-    capacity is reached, with each new filter having:
-    - Exponentially larger capacity (2x or 4x growth)
-    - Tighter error rate (multiplied by tightening ratio 0.9)
-
-    This maintains overall false positive probability while accommodating
-    unbounded growth.
-
-    Class Attributes:
-        SMALL_SET_GROWTH (int): Growth factor of 2 - slower growth, less memory
-        LARGE_SET_GROWTH (int): Growth factor of 4 - faster growth (default)
-        FILE_FMT (str): Binary format string for serialization
+    Layer i receives budget ``error_rate * (1 - ratio) * ratio ** i``. The
+    budgets form a geometric partition of the total target, so the union bound
+    across all present and future layers never exceeds ``error_rate``.
     """
     SMALL_SET_GROWTH = 2  # Growth factor for memory-constrained scenarios
     LARGE_SET_GROWTH = 4  # Growth factor for performance (default)
     FILE_FMT = '<idQd'
 
     def __init__(self, initial_capacity=100, error_rate=0.001,
-                 mode=LARGE_SET_GROWTH):
-        """Initialize a Scalable Bloom Filter.
+                 mode=LARGE_SET_GROWTH, ratio=0.9):
+        """Initialize a scalable filter with one total error budget."""
+        if not 0 < error_rate < 1:
+            raise ValueError("Error_Rate must be between 0 and 1.")
+        if not isinstance(initial_capacity, int) or initial_capacity <= 0:
+            raise ValueError("Initial capacity must be a positive integer.")
+        if not isinstance(mode, int) or mode < 2:
+            raise ValueError("Growth mode must be an integer >= 2.")
+        if not 0 < ratio < 1:
+            raise ValueError("Budget ratio must be between 0 and 1.")
 
-        Args:
-            initial_capacity (int, optional): Initial capacity of the first
-                internal filter. Default is 100. Subsequent filters grow
-                exponentially based on the mode.
-            error_rate (float, optional): Target overall false positive
-                probability. Must be > 0. Default is 0.001 (0.1%). Each
-                internal filter uses a tighter error rate (× 0.9) to maintain
-                this overall rate.
-            mode (int, optional): Growth rate for new filters. Must be either
-                SMALL_SET_GROWTH (2) or LARGE_SET_GROWTH (4). Default is
-                LARGE_SET_GROWTH.
-
-        Raises:
-            ValueError: If error_rate is not positive
-
-        Example:
-            >>> sbf = ScalableBloomFilter(
-            ...     initial_capacity=1000,
-            ...     error_rate=0.001,
-            ...     mode=ScalableBloomFilter.LARGE_SET_GROWTH
-            ... )
-            >>> for i in range(10000):
-            ...     sbf.add(i)  # Automatically scales
-            >>> len(sbf)
-            10000
-
-        Performance Notes:
-            - SMALL_SET_GROWTH: Better for memory-constrained scenarios
-            - LARGE_SET_GROWTH: Better for performance when memory allows
-            - Tightening ratio of 0.9 balances space and accuracy
-
-        Requires:
-            Python 3.6+
-        """
-        if not error_rate or error_rate < 0:
-            raise ValueError("Error_Rate must be a decimal less than 0.")
-        self._setup(mode, 0.9, initial_capacity, error_rate)
+        self._setup(mode, ratio, initial_capacity, error_rate)
         self.filters = []
 
     def _setup(self, mode, ratio, initial_capacity, error_rate):
         """Internal setup method for initializing or restoring filter state.
 
-        Args:
-            mode (int): Growth factor (SMALL_SET_GROWTH or LARGE_SET_GROWTH)
-            ratio (float): Tightening ratio for error rates (typically 0.9)
-            initial_capacity (int): Starting capacity
-            error_rate (float): Target false positive probability
+        Validate parameters when restoring a persisted filter as well.
         """
+        if not 0 < error_rate < 1:
+            raise ValueError("Error_Rate must be between 0 and 1.")
+        if not isinstance(initial_capacity, int) or initial_capacity <= 0:
+            raise ValueError("Initial capacity must be a positive integer.")
+        if not isinstance(mode, int) or mode < 2:
+            raise ValueError("Growth mode must be an integer >= 2.")
+        if not 0 < ratio < 1:
+            raise ValueError("Budget ratio must be between 0 and 1.")
+
         self.scale = mode
         self.ratio = ratio
         self.initial_capacity = initial_capacity
         self.error_rate = error_rate
+
+    def layer_budget(self, index):
+        """Return the false-positive budget allocated to ``index``."""
+        return self.error_rate * (1 - self.ratio) * (self.ratio ** index)
+
+    @property
+    def layer_budgets(self):
+        """Return the budgets allocated to the currently existing layers."""
+        return [self.layer_budget(i) for i in range(len(self.filters))]
+
+    @property
+    def error_upper_bound(self):
+        """Joint union bound implied by the current bit arrays."""
+        return min(1.0, sum(layer.current_error_rate() for layer in self.filters))
+
+    def _create_layer(self, index):
+        """Create a layer whose dimensions are set by its own budget."""
+        budget = self.layer_budget(index)
+        if budget <= 0.0 or not math.isfinite(budget):
+            raise IndexError("ScalableBloomFilter has exhausted its floating-point budget")
+
+        capacity = self.initial_capacity * (self.scale ** index)
+        return BloomFilter(capacity=capacity, error_rate=budget)
+
+    def _set_key(self, layer, key, hashes):
+        """Set key bits and count only insertions that change occupancy."""
+        changed = False
+        offset = 0
+        for index, position in enumerate(hashes):
+            bit_position = offset + position
+            if not layer.bitarray[bit_position]:
+                layer.bitarray[bit_position] = True
+                layer.slice_set_counts[index] += 1
+                changed = True
+            offset += layer.bits_per_slice
+
+        if changed:
+            layer.count += 1
+        return changed
 
     def __contains__(self, key):
         """Test whether an element is in the Scalable Bloom filter.
@@ -729,9 +803,7 @@ class ScalableBloomFilter:
     def add(self, key):
         """Add an element to the Scalable Bloom filter.
 
-        Automatically creates new internal filters as needed when capacity is
-        reached. New filters are exponentially larger with tighter error rates
-        to maintain the overall target false positive probability.
+        Creates a new layer when projected occupancy would exceed its budget.
 
         Args:
             key: The element to add (any hashable type)
@@ -758,47 +830,42 @@ class ScalableBloomFilter:
             The duplicate check (key in self) adds overhead. For bulk loading
             of known-unique data, consider modifying to skip this check.
         """
-        # Check for duplicates across all filters
         if key in self:
             return True
 
-        # Create first filter if needed
         if not self.filters:
-            filter = BloomFilter(
-                capacity=self.initial_capacity,
-                error_rate=self.error_rate * self.ratio)
-            self.filters.append(filter)
+            layer = self._create_layer(0)
+            self.filters.append(layer)
+            hashes = tuple(layer.make_hashes(key))
         else:
-            # Check if current filter is at capacity
-            filter = self.filters[-1]
-            if filter.count >= filter.capacity:
-                # Create new filter with exponential growth and tighter error rate
-                filter = BloomFilter(
-                    capacity=filter.capacity * self.scale,
-                    error_rate=filter.error_rate * self.ratio)
-                self.filters.append(filter)
+            layer = self.filters[-1]
+            hashes = tuple(layer.make_hashes(key))
+            if layer.projected_error_rate(hashes) > layer.error_rate:
+                layer = self._create_layer(len(self.filters))
+                self.filters.append(layer)
+                hashes = tuple(layer.make_hashes(key))
 
-        # Add to most recent filter (skip_check=True since we already checked above)
-        filter.add(key, skip_check=True)
+        self._set_key(layer, key, hashes)
         return False
 
     def union(self, other):
         """Calculate the union of two Scalable Bloom filters.
 
         Creates a new Scalable Bloom filter containing elements from either
-        filter. The filters must have matching parameters (mode, initial
-        capacity, error rate).
+        filter. Corresponding layers must have matching dimensions, and merged
+        occupancy must remain within that layer's budget.
 
         Args:
             other (ScalableBloomFilter): Another ScalableBloomFilter to union
-                with this one. Must have the same mode, initial_capacity, and
-                error_rate.
+                with this one. Must have the same mode, ratio,
+                initial_capacity and error_rate.
 
         Returns:
             ScalableBloomFilter: A new filter representing the union
 
         Raises:
-            ValueError: If filters have incompatible parameters
+            ValueError: If filters are incompatible or merged occupancy breaks
+                the layer budget
 
         Time Complexity:
             O(M × n) where M is bit array size and n is number of filters
@@ -814,35 +881,53 @@ class ScalableBloomFilter:
 
         Implementation Details:
             - Unions corresponding internal filters using bitwise OR
-            - Handles filters with different numbers of internal filters
-            - Deep copies the larger filter to avoid modifying originals
+            - Re-estimates counts from actual bit occupancy
+            - Rejects combinations that cannot preserve the budget contract
         """
         if self.scale != other.scale or \
+                self.ratio != other.ratio or \
                 self.initial_capacity != other.initial_capacity or \
                 self.error_rate != other.error_rate:
             raise ValueError("Unioning two scalable bloom filters requires "
-                           "both filters to have both the same mode, initial capacity and error rate")
+                           "the same mode, ratio, initial capacity and error rate")
 
-        # Deep copy the larger filter to preserve more data
-        if len(self.filters) > len(other.filters):
-            larger_sbf = copy.deepcopy(self)
-            smaller_sbf = other
-        else:
-            larger_sbf = copy.deepcopy(other)
-            smaller_sbf = self
+        result = self.__class__.__new__(self.__class__)
+        result._setup(self.scale, self.ratio,
+                      self.initial_capacity, self.error_rate)
+        result.filters = []
 
-        # Union corresponding internal filters
-        new_filters = []
-        for i in range(len(smaller_sbf.filters)):
-            new_filter = larger_sbf.filters[i] | smaller_sbf.filters[i]
-            new_filters.append(new_filter)
+        layer_count = max(len(self.filters), len(other.filters))
+        for index in range(layer_count):
+            if index < len(self.filters) and index < len(other.filters):
+                left = self.filters[index]
+                right = other.filters[index]
+                if left.capacity != right.capacity or \
+                        left.error_rate != right.error_rate or \
+                        left.num_slices != right.num_slices or \
+                        left.bits_per_slice != right.bits_per_slice:
+                    raise ValueError("Union requires matching parameters at every layer")
 
-        # Append remaining filters from larger filter
-        for i in range(len(smaller_sbf.filters), len(larger_sbf.filters)):
-            new_filters.append(larger_sbf.filters[i])
+                merged = left.copy()
+                merged.bitarray = merged.bitarray | right.bitarray
+                merged._refresh_slice_set_counts()
+                if merged.current_error_rate() > merged.error_rate:
+                    raise ValueError(
+                        "Union would exceed this layer's false-positive budget")
+                merged.count = merged.estimated_count()
+            elif index < len(self.filters):
+                merged = self.filters[index].copy()
+            else:
+                merged = other.filters[index].copy()
 
-        larger_sbf.filters = new_filters
-        return larger_sbf
+            if merged.error_rate != self.layer_budget(index):
+                raise ValueError("Layer budgets do not match the stored policy")
+            if merged.current_error_rate() > merged.error_rate:
+                raise ValueError(
+                    "Union would exceed this layer's false-positive budget")
+            merged.count = merged.estimated_count()
+            result.filters.append(merged)
+
+        return result
 
     def __or__(self, other):
         """Implement the | operator for union operation.
@@ -962,9 +1047,9 @@ class ScalableBloomFilter:
             Filters saved with version < 4.0.0 are incompatible due to hash
             function changes (MD5 → xxHash).
         """
-        filter = cls()
-        # Read main filter parameters
-        filter._setup(*unpack(cls.FILE_FMT, f.read(calcsize(cls.FILE_FMT))))
+        restored = cls.__new__(cls)
+        restored._setup(*unpack(cls.FILE_FMT, f.read(calcsize(cls.FILE_FMT))))
+        restored.filters = []
 
         # Read number of internal filters
         nfilters, = unpack(b'<l', f.read(calcsize(b'<l')))
@@ -977,11 +1062,34 @@ class ScalableBloomFilter:
 
             # Read each internal filter
             for fl in filter_lengths:
-                filter.filters.append(BloomFilter.fromfile(f, fl))
+                restored.filters.append(BloomFilter.fromfile(f, fl))
         else:
-            filter.filters = []
+            restored.filters = []
 
-        return filter
+        for index, layer in enumerate(restored.filters):
+            expected_capacity = restored.initial_capacity * (restored.scale ** index)
+            if layer.capacity != expected_capacity:
+                raise ValueError("Persisted layer capacity does not match growth policy")
+            if layer.error_rate != restored.layer_budget(index):
+                raise ValueError("Persisted layer budget does not match growth policy")
+            if layer.current_error_rate() > layer.error_rate:
+                raise ValueError("Persisted layer exceeds its false-positive budget")
+
+        return restored
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['filters'] = [layer.__getstate__() for layer in self.filters]
+        return state
+
+    def __setstate__(self, state):
+        layer_states = state.pop('filters')
+        self.__dict__.update(state)
+        self.filters = []
+        for layer_state in layer_states:
+            layer = BloomFilter.__new__(BloomFilter)
+            layer.__setstate__(layer_state)
+            self.filters.append(layer)
 
     def __len__(self):
         """Return the total number of elements across all internal filters.

@@ -30,7 +30,7 @@ A Bloom filter is a space-efficient probabilistic data structure that is used to
 
 - **Python 3.6+:** Modern Python 3 implementation without legacy Python 2 baggage
 
-- **Optimized space usage:** Tightening ratio of 0.9 provides excellent space efficiency across a wide range of growth patterns
+- **Bounded aggregate error:** Each new layer receives a decreasing share of one total false-positive budget
 
 ## Installation
 
@@ -82,7 +82,9 @@ already_exists = f.add("mango")  # Returns False
 
 ### ScalableBloomFilter
 
-The `ScalableBloomFilter` automatically grows as you add more elements, maintaining the target error rate:
+The `ScalableBloomFilter` automatically grows as you add more elements. Layer `i`
+receives the budget `error_rate * (1 - ratio) * ratio ** i`, so the union bound
+across all present and future layers never exceeds the requested target:
 
 ```python
 import pybloom_live
@@ -91,7 +93,8 @@ import pybloom_live
 sbf = pybloom_live.ScalableBloomFilter(
     initial_capacity=100,
     error_rate=0.001,
-    mode=pybloom_live.ScalableBloomFilter.LARGE_SET_GROWTH
+    mode=pybloom_live.ScalableBloomFilter.LARGE_SET_GROWTH,
+    ratio=0.9
 )
 
 # Add many elements - it scales automatically
@@ -101,6 +104,7 @@ for i in range(10000):
 print(f"Elements: {len(sbf)}")           # ~10000
 print(f"Capacity: {sbf.capacity}")       # Automatically expanded
 print(f"Filters: {len(sbf.filters)}")    # Multiple internal filters
+print(f"Bound: {sbf.error_upper_bound}") # Current joint upper bound
 
 # Check membership
 print(5000 in sbf)   # True
@@ -110,6 +114,12 @@ print(10000 in sbf)  # False
 **Growth modes:**
 - `SMALL_SET_GROWTH = 2`: Slower growth, uses less memory
 - `LARGE_SET_GROWTH = 4`: Faster growth (default), better for large datasets
+
+`ratio` is the geometric budget-decay strategy. Each layer's capacity, number
+of hash functions and bit width are derived from its own budget. Growth is
+triggered by projected actual bit occupancy, not by treating `len()` as an
+exact distinct-key count. Unions corresponding layers and reject combinations
+whose merged occupancy would exceed that layer's budget.
 
 ## Examples
 
@@ -253,11 +263,12 @@ BloomFilter(capacity, error_rate=0.001)
 
 **Constructor:**
 ```python
-ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWTH)
+ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWTH, ratio=0.9)
 ```
 - `initial_capacity`: Starting capacity
-- `error_rate`: Target false positive probability
+- `error_rate`: Target joint false-positive upper bound
 - `mode`: Growth mode (`SMALL_SET_GROWTH=2` or `LARGE_SET_GROWTH=4`)
+- `ratio`: Geometric decay factor for per-layer budgets
 
 **Methods:**
 - `add(key)`: Add element to filter
@@ -269,7 +280,9 @@ ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWT
 **Properties:**
 - `capacity`: Total capacity (sum of all internal filters)
 - `count`: Total elements added
-- `error_rate`: Target error rate
+- `error_rate`: Target joint false-positive upper bound
+- `error_upper_bound`: Bound implied by the current bit occupancy
+- `layer_budgets`: Per-layer budget allocation
 - `filters`: List of internal `BloomFilter` instances
 
 ## Hash Functions
@@ -290,10 +303,11 @@ This implementation follows the Scalable Bloom Filter algorithm from:
 
 > P. Almeida, C.Baquero, N. Preguiça, D. Hutchison, **Scalable Bloom Filters**, (GLOBECOM 2007), IEEE, 2007.
 
-**Key optimizations:**
-- **Tightening ratio of 0.9**: Provides better average space usage across a wide range of growth patterns
+**Budget contract:**
+- **Geometric budgets**: Layer `i` receives `P(1-r)r^i`; all infinite future budgets sum to `P`
 - **Exponential growth**: New filters are 2x or 4x larger than the previous one
-- **Error rate tightening**: Each new filter has a tighter error probability to maintain overall target rate
+- **Occupancy-triggered growth**: Actual set-bit density detects oversaturation; `count` is not assumed to be exact
+- **Safe unions**: Counts are re-estimated from bit occupancy, and combinations that cannot preserve the bound are rejected
 - **Optimal bit calculation**: Uses `M ≈ n × |ln(P)| / (ln(2)²)` where n is capacity and P is error rate
 
 ## Breaking Changes in Version 4.x

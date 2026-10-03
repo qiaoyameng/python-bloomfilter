@@ -2,7 +2,7 @@
 """Setup script for pybloom_live - Python 3 Bloom Filter implementation."""
 from setuptools import setup
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 DESCRIPTION = "Bloom filter: A Probabilistic data structure"
 LONG_DESCRIPTION = """
 A fast, pure-Python Bloom filter implementation with optimized hash functions.
