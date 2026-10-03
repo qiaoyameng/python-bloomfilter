@@ -23,6 +23,8 @@ Requirements:
 import copy
 import hashlib
 import math
+import threading
+import time
 from io import BytesIO
 from struct import calcsize, pack, unpack
 
@@ -1000,6 +1002,360 @@ class ScalableBloomFilter:
             100
         """
         return sum(f.count for f in self.filters)
+
+
+class RollingBloomFilter:
+    """A time-windowed Bloom filter that forgets keys after a bounded window.
+
+    This is intended for use cases such as crawler URL de-duplication where
+    only recent activity matters and the structure must not grow without
+    bound. The filter keeps a fixed ring of independent Bloom-filter slices
+    (time buckets). Insertions land in the current slice; membership queries
+    take the logical union of all currently valid slices.
+
+    Retention semantics (important):
+        This is *not* a per-key TTL structure. There is no per-key expiry
+        timestamp, so no key-level expiry precision is claimed. A key inserted
+        at time ``t`` is guaranteed to be reported present for queries at
+        ``t + window`` and is guaranteed to have been forgotten by
+        ``t + window + slice_seconds`` (assuming the clock advances normally
+        and the key is not re-inserted). Therefore:
+
+            minimum retention   = ``window`` seconds
+            maximum extra       = ``slice_seconds`` seconds (just under)
+
+        A key remains reported for a random-looking but bounded amount inside
+        ``[window, window + slice_seconds]`` depending on where in a slice it
+        was inserted. Re-inserting a key always writes it into the current
+        slice even if it is already matched by an older slice; this refreshes
+        the key so it is not lost when that older slice rotates out.
+
+    False positive budget:
+        At any moment ``num_slices`` slices are valid and queried in union, so
+        a false positive occurs if *any* slice yields one. The overall budget
+        ``error_rate`` is split evenly across the slices; each slice is built
+        with error rate ``q`` where ``(1 - q) ** num_slices == 1 -
+        error_rate``, i.e. ``q = 1 - (1 - error_rate) ** (1 / num_slices)``.
+        Each slice is sized for ``slice_capacity`` insertions at rate ``q``.
+
+    Rotation safety:
+        The ring holds ``num_slices + 1`` slots: ``num_slices`` valid slices
+        plus one spare. When time moves to a new slice, the slot being reused
+        is the spare, which never overlaps a still-valid slice (even when
+        several slices are crossed at once). Clearing it therefore cannot
+        discard fresh data.
+
+    Clock handling:
+        ``time_func`` is injectable for deterministic testing. The clock is
+        expected to be non-decreasing; if it moves backwards (NTP step, replay
+        of old state), the observed time is clamped to the last seen time so
+        expired slices are never "resurrected" into the current slice. Jumps
+        spanning many slices clear every slot they cross; a jump past the full
+        ring resets the whole ring.
+
+    Args:
+        window (float, optional): Minimum retention duration in seconds.
+            Defaults to 3600 (one hour).
+        num_slices (int, optional): Number of valid slices covering the
+            window. Slice length is ``slice_seconds = window / (num_slices
+            - 1)`` and max extra retention is one slice length. Defaults to 6.
+        slice_capacity (int, optional): Expected insertions per slice at the
+            target error rate. Defaults to 10000.
+        error_rate (float, optional): Overall false-positive budget for a
+            query over all valid slices. Defaults to 0.001.
+        time_func (callable, optional): Zero-argument callable returning the
+            current time in seconds. Defaults to :func:`time.monotonic`. Use
+            :func:`time.time` together with :meth:`tofile` if state must be
+            restored in another process, and keep the same time base.
+
+    Example:
+        >>> clock = FakeClock()
+        >>> rbf = RollingBloomFilter(window=3600, num_slices=4, time_func=clock)
+        >>> rbf.add('http://example.com')  # doctest: +ELLIPSIS
+        False
+        >>> 'http://example.com' in rbf
+        True
+    """
+
+    MAGIC = b'RBF1'
+    HEADER_FMT = b'<4sQddddQq'
+
+    def __init__(self, window=3600.0, num_slices=6, slice_capacity=10000,
+                 error_rate=0.001, time_func=time.monotonic):
+        if not window > 0:
+            raise ValueError("window must be > 0")
+        if num_slices < 2:
+            raise ValueError("num_slices must be >= 2")
+        if not slice_capacity > 0:
+            raise ValueError("slice_capacity must be > 0")
+        if not (0 < error_rate < 1):
+            raise ValueError("error_rate must be between 0 and 1")
+
+        self.window = float(window)
+        self.num_slices = int(num_slices)
+        self.slice_capacity = int(slice_capacity)
+        self.error_rate = float(error_rate)
+        self._time_func = time_func
+        self._lock = threading.RLock()
+
+        self.slice_seconds = self.window / (self.num_slices - 1)
+        # Split the union false-positive budget evenly across valid slices.
+        self.slice_error_rate = 1.0 - (1.0 - self.error_rate) ** (
+            1.0 / self.num_slices)
+
+        num_slots = self.num_slices + 1
+        self._slots = [
+            BloomFilter(capacity=self.slice_capacity,
+                        error_rate=self.slice_error_rate)
+            for _ in range(num_slots)]
+        # Current slot is initialized with the first observed time lazily, so
+        # a freshly created filter does not age before first use.
+        self._current_slot = 0
+        self._current_bucket = None
+        self._last_time = None
+
+    @property
+    def min_retention(self):
+        """Minimum guaranteed retention in seconds (equals ``window``)."""
+        return self.window
+
+    @property
+    def max_extra_retention(self):
+        """Supremum of extra retention beyond the window, in seconds.
+
+        A key can be reported for strictly less than ``window +
+        slice_seconds`` seconds; the supremum of the extra amount is
+        ``slice_seconds``.
+        """
+        return self.slice_seconds
+
+    @property
+    def num_slots(self):
+        """Total physical slots in the ring (valid slices plus one spare)."""
+        return self.num_slices + 1
+
+    def _bucket_of(self, t):
+        """Return the time-bucket index for time ``t``."""
+        return int(math.floor(t / self.slice_seconds))
+
+    def _slot_of(self, bucket):
+        """Map a bucket index to its physical ring slot."""
+        return bucket % (self.num_slices + 1)
+
+    def _advance(self, now):
+        """Advance the ring so its current slice covers time ``now``.
+
+        Must be called with ``self._lock`` held.
+        """
+        if self._last_time is None:
+            # First observation: anchor the ring without aging.
+            bucket = self._bucket_of(now)
+            self._current_bucket = bucket
+            self._current_slot = self._slot_of(bucket)
+            self._last_time = now
+            return
+
+        if now < self._last_time:
+            # Clock moved backwards: clamp so expired data cannot be
+            # resurrected. The ring keeps using the last known time.
+            now = self._last_time
+
+        new_bucket = self._bucket_of(now)
+        delta = new_bucket - self._current_bucket
+        if delta <= 0:
+            self._last_time = now
+            return
+
+        if delta >= self.num_slots:
+            # The jump spans more slots than the ring holds; every slice is
+            # stale. Reset all slots before installing the new current one.
+            for slot in self._slots:
+                slot.bitarray.setall(False)
+                slot.count = 0
+            self._current_bucket = new_bucket
+            self._current_slot = self._slot_of(new_bucket)
+            self._last_time = now
+            return
+
+        # Cross 1..num_slices bucket boundaries. The slots being cleared are
+        # exactly the destination buckets; their old contents are outside the
+        # valid window and never include a still-valid slice.
+        for offset in range(1, delta + 1):
+            slot = self._slot_of(self._current_bucket + offset)
+            self._slots[slot].bitarray.setall(False)
+            self._slots[slot].count = 0
+        self._current_bucket = new_bucket
+        self._current_slot = self._slot_of(new_bucket)
+        self._last_time = now
+
+    def _valid_slot_indices(self):
+        """Physical slots backing the current and previous valid slices."""
+        for age in range(self.num_slices):
+            yield self._slot_of(self._current_bucket - age)
+
+    def add(self, key, skip_check=False):
+        """Add ``key`` to the current slice.
+
+        Even when the key already matches an older slice it is written into
+        the current slice, so its retention is refreshed. Without this, the
+        key would vanish as soon as the old slice rotated out.
+
+        Args:
+            key: The element to add (str, bytes, or any object with __str__).
+            skip_check (bool, optional): Kept for API symmetry; ignored. A
+                membership scan is always performed over the valid slices to
+                report whether the key was already seen.
+
+        Returns:
+            bool: True if the key already matched some valid slice before
+                this insertion (possible false positive); False otherwise.
+
+        Raises:
+            IndexError: If the current slice is already at capacity.
+        """
+        with self._lock:
+            now = self._time_func()
+            self._advance(now)
+            already_present = False
+            for idx in self._valid_slot_indices():
+                if key in self._slots[idx]:
+                    already_present = True
+                    break
+            # Unconditionally (re)write into the current slice.
+            self._slots[self._current_slot].add(key, skip_check=True)
+            return already_present
+
+    def __contains__(self, key):
+        """Return True if ``key`` matches the union of all valid slices."""
+        with self._lock:
+            now = self._time_func()
+            self._advance(now)
+            for idx in self._valid_slot_indices():
+                if key in self._slots[idx]:
+                    return True
+            return False
+
+    def __len__(self):
+        """Number of insertion operations recorded across all slots."""
+        with self._lock:
+            return sum(slot.count for slot in self._slots)
+
+    def touch(self):
+        """Advance slices to the current time without inserting a key."""
+        with self._lock:
+            self._advance(self._time_func())
+
+    def tofile(self, f):
+        """Serialize the rolling filter to a binary file.
+
+        The ``time_func`` is not serialized; after :meth:`fromfile` the filter
+        uses :func:`time.monotonic` by default. Pass ``time_func`` explicitly
+        to ``fromfile`` to restore with a specific clock (recommended when the
+        original used wall-clock time).
+        """
+        with self._lock:
+            f.write(pack(
+                self.HEADER_FMT,
+                self.MAGIC,
+                self.num_slices,
+                self.window,
+                self.slice_seconds,
+                self.error_rate,
+                self.slice_error_rate,
+                self.slice_capacity,
+                self._current_bucket if self._current_bucket is not None else -1))
+            last_time = self._last_time if self._last_time is not None else -1.0
+            f.write(pack(b'<dQ', last_time, self._current_slot))
+            for slot in self._slots:
+                # Frame each slice with its byte length so fromfile() can read
+                # several Bloom filters from one stream (BloomFilter.fromfile
+                # otherwise reads to EOF).
+                body = BytesIO()
+                slot.tofile(body)
+                payload = body.getvalue()
+                f.write(pack(b'<Q', len(payload)))
+                f.write(payload)
+
+    @classmethod
+    def fromfile(cls, f, time_func=time.monotonic):
+        """Deserialize a rolling filter previously written by :meth:`tofile`.
+
+        Args:
+            f: Binary file-like object positioned at the RBF header.
+            time_func (callable, optional): Clock to use after restoration.
+                Should use the same time base as the clock used before saving.
+
+        Raises:
+            ValueError: If the stream does not contain a rolling filter or
+                its parameters are inconsistent.
+        """
+        header = f.read(calcsize(cls.HEADER_FMT))
+        if len(header) < calcsize(cls.HEADER_FMT):
+            raise ValueError("not a RollingBloomFilter stream")
+        magic, num_slices, window, slice_seconds, error_rate, \
+            slice_error_rate, slice_capacity, current_bucket = unpack(
+                cls.HEADER_FMT, header)
+        if magic != cls.MAGIC:
+            raise ValueError("not a RollingBloomFilter stream")
+
+        last_time, current_slot = unpack(b'<dQ', f.read(calcsize(b'<dQ')))
+
+        filter = cls(window=window, num_slices=num_slices,
+                     slice_capacity=slice_capacity, error_rate=error_rate,
+                     time_func=time_func)
+        if abs(filter.slice_seconds - slice_seconds) > 1e-9:
+            raise ValueError("slice_seconds mismatch")
+        if abs(filter.slice_error_rate - slice_error_rate) > 1e-12:
+            raise ValueError("slice_error_rate mismatch")
+
+        filter._slots = [
+            cls._read_slot(f) for _ in range(num_slices + 1)]
+        filter._current_bucket = None if current_bucket == -1 else current_bucket
+        filter._last_time = None if last_time < 0 else last_time
+        if filter._current_bucket is not None:
+            filter._current_slot = filter._slot_of(filter._current_bucket)
+        return filter
+
+    @staticmethod
+    def _read_slot(f):
+        """Read one length-framed internal Bloom filter slice."""
+        (size,) = unpack(b'<Q', f.read(calcsize(b'<Q')))
+        return BloomFilter.fromfile(f, n=size)
+
+    def __getstate__(self):
+        d = self.__dict__.copy()
+        del d['_lock']
+        d['_time_func'] = None
+        return d
+
+    def __setstate__(self, d):
+        self.__dict__.update(d)
+        self._lock = threading.RLock()
+        if self._time_func is None:
+            self._time_func = time.monotonic
+
+
+class FakeClock:
+    """A manually controlled clock for deterministic rolling-filter tests.
+
+    Time only moves when :meth:`advance` (or :meth:`set`) is called, so tests
+    never wait a real second, let alone an hour. It can also be moved
+    backwards to exercise clock-rollback handling.
+    """
+
+    def __init__(self, start=0.0):
+        self._now = float(start)
+
+    def __call__(self):
+        return self._now
+
+    def advance(self, seconds):
+        """Move the clock forward by ``seconds`` (may be fractional)."""
+        self._now += float(seconds)
+
+    def set(self, value):
+        """Set the clock to an absolute value, possibly backwards."""
+        self._now = float(value)
 
 
 if __name__ == "__main__":

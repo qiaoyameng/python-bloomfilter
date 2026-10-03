@@ -21,6 +21,7 @@ A Bloom filter is a space-efficient probabilistic data structure that is used to
 - **Two implementations:**
   - `BloomFilter`: Fixed-capacity filter for known dataset sizes
   - `ScalableBloomFilter`: Automatically grows to accommodate more elements
+  - `RollingBloomFilter`: Fixed ring of time slices; forgets keys after a bounded recent window (e.g. crawler de-duplication)
 
 - **High performance:** Uses xxHash for 128-bit hashing - one of the fastest non-cryptographic hash functions available
 
@@ -110,6 +111,49 @@ print(10000 in sbf)  # False
 **Growth modes:**
 - `SMALL_SET_GROWTH = 2`: Slower growth, uses less memory
 - `LARGE_SET_GROWTH = 4`: Faster growth (default), better for large datasets
+
+### RollingBloomFilter
+
+The `RollingBloomFilter` is bounded in size and only remembers activity from a
+recent time window. It keeps a fixed ring of time slices: inserts land in the
+current slice, and queries take the union of all currently valid slices. This
+suits crawler de-duplication where anything older than an hour is irrelevant.
+
+```python
+import pybloom_live
+from pybloom_live import RollingBloomFilter, FakeClock
+
+# Inject a clock for tests; in production omit it (defaults to time.monotonic).
+clock = FakeClock()
+rbf = RollingBloomFilter(
+    window=3600,          # minimum retention: one hour
+    num_slices=6,         # 6 valid slices -> slice = 3600/5 = 720s
+    slice_capacity=10000, # expected inserts per slice
+    error_rate=0.001,     # overall false-positive budget over all slices
+    time_func=clock,
+)
+
+rbf.add("http://example.com/page")
+print("http://example.com/page" in rbf)  # True
+
+# Re-adding a key (even when an old slice already matches) writes it into the
+# current slice, refreshing it so it is not lost when the old slice exits.
+clock.advance(1000)
+rbf.add("http://example.com/page")
+```
+
+**Retention contract** — this is *not* a per-key TTL (no per-key expiry
+timestamps exist):
+
+- Minimum retention: exactly `window` seconds.
+- Maximum extra retention: strictly less than `window / (num_slices - 1)`
+  seconds (one slice length).
+
+The overall `error_rate` is split evenly across the valid slices as
+`q = 1 - (1 - error_rate) ** (1 / num_slices)`, so the union query stays at
+the requested budget. Time can jump across several slices or backwards (the
+clock is then clamped); state can be saved/loaded with `tofile()`/`fromfile()`,
+optionally using `time.time()` as the injected clock.
 
 ## Examples
 
