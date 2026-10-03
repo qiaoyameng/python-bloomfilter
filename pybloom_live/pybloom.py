@@ -137,6 +137,214 @@ def make_hashfuncs(num_slices, num_bits):
     return _hash_maker, hashfn
 
 
+# =============================================================================
+# Cardinality estimation (statistics interface)
+# =============================================================================
+#
+# The estimators below infer set cardinalities from the bit occupancy of a
+# Bloom filter bitmap instead of trusting the insertion counter (``len``).
+#
+# Method (Swamidass & Baldi, 2007, "Mathematical Formulas for Bloom Filter
+# Cardinalities"): each element sets exactly one bit in each of the k hash
+# slices, and each slice has m = bits_per_slice bits, so an element is like a
+# ball thrown into m bins per slice. After n distinct elements the expected
+# fraction of unset bits per slice is exp(-n / m), giving the estimator
+#
+#     n_hat = -m * ln(1 - X / M)
+#
+# where X is the number of set bits and M = k * m is the total number of
+# bits. The union cardinality is estimated from the merged (bitwise OR)
+# bitmap, and the intersection / Jaccard similarity follow by
+# inclusion-exclusion: |A ∩ B| = |A| + |B| - |A ∪ B|.
+#
+# Known error sources (reported via CardinalityEstimate.notes):
+#   * The k hash slices are derived from salted copies of a single hash
+#     function, so slice occupancies are mildly correlated; the stated
+#     standard error assumes independent uniform hashing and is optimistic.
+#   * With finitely many bits the estimator saturates: as the fill fraction
+#     approaches 1 the estimate diverges and single-bit changes swing it
+#     wildly. A completely filled bitmap carries no cardinality information
+#     beyond a lower bound.
+#   * Inclusion-exclusion subtracts two noisy estimates, so intersection and
+#     Jaccard errors exceed the per-filter errors, especially for small true
+#     overlaps.
+
+
+class CardinalityEstimate:
+    """Result of estimating a cardinality from Bloom filter bit occupancy.
+
+    This is a statistical estimate, never an exact count (except for empty
+    filters). Use ``status`` to tell the cases apart:
+
+    - ``'exact'``: the bitmap is empty; the cardinality is exactly 0.
+    - ``'estimate'``: a finite estimate with an uncertainty interval.
+    - ``'saturated'``: every bit is set; no finite estimate exists, only a
+      lower bound.
+    - ``'unestimable'``: derived quantity (intersection) that cannot be
+      estimated because an input is saturated.
+
+    Attributes:
+        estimate (float | None): Point estimate of the number of distinct
+            elements, or None when no finite estimate exists.
+        lower (float | None): Lower bound of an approximate 95% interval
+            (estimate - 2 standard errors, clamped at 0), or a conservative
+            lower bound when saturated.
+        upper (float | None): Upper bound of the interval, or None when
+            unbounded (saturated).
+        std_error (float | None): Delta-method standard error, or None when
+            not applicable.
+        status (str): One of 'exact', 'estimate', 'saturated', 'unestimable'.
+        fill (float | None): Fraction of bits set, between 0.0 and 1.0.
+        set_bits (int | None): Number of bits set in the bitmap.
+        total_bits (int | None): Total number of bits in the bitmap.
+        per_slice_estimates (tuple | None): One point estimate per hash
+            slice; their spread is an empirical indicator of estimation
+            noise. Slices that are completely filled yield ``inf``.
+        notes (tuple of str): Human-readable caveats about this estimate.
+    """
+
+    __slots__ = ('estimate', 'lower', 'upper', 'std_error', 'status', 'fill',
+                 'set_bits', 'total_bits', 'per_slice_estimates', 'notes')
+
+    def __init__(self, estimate, lower, upper, std_error, status,
+                 fill=None, set_bits=None, total_bits=None,
+                 per_slice_estimates=None, notes=()):
+        self.estimate = estimate
+        self.lower = lower
+        self.upper = upper
+        self.std_error = std_error
+        self.status = status
+        self.fill = fill
+        self.set_bits = set_bits
+        self.total_bits = total_bits
+        self.per_slice_estimates = per_slice_estimates
+        self.notes = tuple(notes)
+
+    def __repr__(self):
+        def fmt(value):
+            return 'None' if value is None else '%.3f' % value
+        return ('%s(estimate=%s, lower=%s, upper=%s, status=%r)'
+                % (type(self).__name__, fmt(self.estimate), fmt(self.lower),
+                   fmt(self.upper), self.status))
+
+
+class FilterComparison:
+    """Statistical comparison of two Bloom filters from different sources.
+
+    Attributes:
+        cardinality_a (CardinalityEstimate): Estimate for the first filter.
+        cardinality_b (CardinalityEstimate): Estimate for the second filter.
+        union (CardinalityEstimate): Estimate of |A ∪ B| from the merged
+            (bitwise OR) bitmap.
+        intersection (CardinalityEstimate): Estimate of |A ∩ B| via
+            inclusion-exclusion, clamped to [0, min(|A|, |B|)].
+        jaccard (float | None): Estimated Jaccard similarity in [0, 1], or
+            None when it cannot be estimated.
+        jaccard_status (str): 'exact', 'estimate', or 'unestimable'.
+        notes (tuple of str): Human-readable caveats about the comparison.
+    """
+
+    __slots__ = ('cardinality_a', 'cardinality_b', 'union', 'intersection',
+                 'jaccard', 'jaccard_status', 'notes')
+
+    def __init__(self, cardinality_a, cardinality_b, union, intersection,
+                 jaccard, jaccard_status, notes=()):
+        self.cardinality_a = cardinality_a
+        self.cardinality_b = cardinality_b
+        self.union = union
+        self.intersection = intersection
+        self.jaccard = jaccard
+        self.jaccard_status = jaccard_status
+        self.notes = tuple(notes)
+
+    def __repr__(self):
+        jaccard = 'None' if self.jaccard is None else '%.3f' % self.jaccard
+        return ('%s(a=%s, b=%s, union=%s, intersection=%s, jaccard=%s)'
+                % (type(self).__name__, self.cardinality_a.estimate,
+                   self.cardinality_b.estimate, self.union.estimate,
+                   self.intersection.estimate, jaccard))
+
+
+def _slice_set_bit_counts(bit_array, num_slices, bits_per_slice):
+    """Count the set bits in each hash slice of a Bloom filter bitmap."""
+    counts = []
+    start = 0
+    for _ in range(num_slices):
+        stop = start + bits_per_slice
+        counts.append(bit_array.count(1, start, stop))
+        start = stop
+    return counts
+
+
+def _estimate_cardinality_from_bitmap(bit_array, num_slices, bits_per_slice):
+    """Estimate the distinct-element count encoded in a Bloom filter bitmap.
+
+    Pools the set-bit counts of all hash slices into a single occupancy
+    estimate (see the module-level note for the formula and error sources).
+    Never returns a negative cardinality; empty bitmaps yield an exact 0 and
+    fully set bitmaps yield a 'saturated' result with only a lower bound.
+    """
+    total_bits = num_slices * bits_per_slice
+    counts = _slice_set_bit_counts(bit_array, num_slices, bits_per_slice)
+    set_bits = sum(counts)
+    fill = set_bits / float(total_bits)
+
+    if set_bits == 0:
+        return CardinalityEstimate(
+            estimate=0.0, lower=0.0, upper=0.0, std_error=0.0,
+            status='exact', fill=0.0, set_bits=0, total_bits=total_bits,
+            per_slice_estimates=tuple(0.0 for _ in counts),
+            notes=('Bitmap is empty; the cardinality is exactly 0.',))
+
+    # Estimate obtained if exactly one bit were unset; also the scale at
+    # which the estimator saturates.
+    saturation_scale = bits_per_slice * math.log(total_bits)
+
+    if set_bits >= total_bits:
+        return CardinalityEstimate(
+            estimate=None, lower=saturation_scale, upper=None, std_error=None,
+            status='saturated', fill=1.0, set_bits=set_bits,
+            total_bits=total_bits, per_slice_estimates=None,
+            notes=('All bits are set: the filter is saturated and the '
+                   'cardinality cannot be estimated (the occupancy estimate '
+                   'diverges as the fill fraction approaches 1). The lower '
+                   'bound is the estimate that exactly one unset bit would '
+                   'produce; the true cardinality may be arbitrarily larger.',))
+
+    estimate = -bits_per_slice * math.log1p(-fill)
+    # Delta-method standard error: with p = fill, m = bits_per_slice and
+    # k = num_slices, Var(n_hat) ~= m * p / (k * (1 - p)). Assumes
+    # independent uniform hashing; see notes for why this is optimistic.
+    std_error = math.sqrt(
+        bits_per_slice * fill / (num_slices * (1.0 - fill)))
+    per_slice = tuple(
+        (-bits_per_slice * math.log1p(-count / float(bits_per_slice)))
+        if count < bits_per_slice else float('inf')
+        for count in counts)
+
+    notes = [
+        'Estimate assumes uniform, independent hashing. The hash slices of '
+        'this implementation are derived from salted copies of a single '
+        'hash function, so slice occupancies are mildly correlated and the '
+        'true error may exceed the stated standard error.',
+        'With %d total bits the estimator saturates near %d elements; '
+        'sensitivity to single-bit changes grows without bound as the fill '
+        'fraction approaches 1.' % (total_bits, int(saturation_scale)),
+    ]
+    if fill > 0.9:
+        notes.append(
+            'Fill fraction %.3f exceeds 0.9: the filter is close to '
+            'saturation and this estimate is very unreliable.' % fill)
+
+    return CardinalityEstimate(
+        estimate=estimate,
+        lower=max(0.0, estimate - 2.0 * std_error),
+        upper=estimate + 2.0 * std_error,
+        std_error=std_error, status='estimate', fill=fill,
+        set_bits=set_bits, total_bits=total_bits,
+        per_slice_estimates=per_slice, notes=notes)
+
+
 class BloomFilter:
     FILE_FMT = b'<dQQQQ'
 
@@ -486,6 +694,177 @@ class BloomFilter:
             >>> bf_intersect = bf1 & bf2
         """
         return self.intersection(other)
+
+    def estimate_cardinality(self):
+        """Estimate the number of distinct elements in this filter.
+
+        Unlike ``len()``, which returns the insertion counter, this infers
+        the cardinality from the bit occupancy of each hash slice (see the
+        module-level note for the formula and its error sources). The filter
+        is only read, never modified.
+
+        Returns:
+            CardinalityEstimate: Estimate with an uncertainty interval and
+                a status flag. An empty filter yields an exact 0; a fully
+                saturated filter yields no finite estimate, only a lower
+                bound.
+
+        Example:
+            >>> bf = BloomFilter(1000, 0.001)
+            >>> for i in range(500):
+            ...     _ = bf.add(i)
+            >>> est = bf.estimate_cardinality()
+            >>> est.status
+            'estimate'
+            >>> abs(est.estimate - 500) < 3 * est.std_error
+            True
+        """
+        return _estimate_cardinality_from_bitmap(
+            self.bitarray, self.num_slices, self.bits_per_slice)
+
+    def _check_stats_compatible(self, other):
+        """Verify that two filters have comparable bitmaps.
+
+        Bit positions are only comparable when both filters use identical
+        hash parameters (num_slices, bits_per_slice, hash function), because
+        those fully determine the salts and the bit layout. Key encoding
+        (UTF-8 for text) is fixed by this implementation and therefore
+        always compatible between two BloomFilter instances.
+
+        Raises:
+            TypeError: If other is not a BloomFilter.
+            ValueError: If the hash parameters differ.
+        """
+        if not isinstance(other, BloomFilter):
+            raise TypeError(
+                'Can only compare statistics with another BloomFilter, '
+                'got %r' % type(other).__name__)
+        hashfn_name = getattr(self.hashfn, '__name__', repr(self.hashfn))
+        other_hashfn_name = getattr(other.hashfn, '__name__',
+                                    repr(other.hashfn))
+        if (self.num_slices != other.num_slices
+                or self.bits_per_slice != other.bits_per_slice
+                or hashfn_name != other_hashfn_name):
+            raise ValueError(
+                'Comparing filter statistics requires compatible hash '
+                'parameters (num_slices=%r vs %r, bits_per_slice=%r vs %r, '
+                'hash function=%r vs %r): bit positions are not comparable '
+                'otherwise.' % (self.num_slices, other.num_slices,
+                                self.bits_per_slice, other.bits_per_slice,
+                                hashfn_name, other_hashfn_name))
+
+    def compare(self, other):
+        """Estimate cardinalities, union, intersection and Jaccard similarity.
+
+        Both filters are only read, never modified. The union cardinality is
+        estimated from the merged (bitwise OR) bitmap; the intersection and
+        Jaccard similarity follow by inclusion-exclusion. The bitwise AND of
+        the two bitmaps is deliberately NOT used: a Bloom intersection
+        carries false positives and is not an exact representation of the
+        set intersection.
+
+        Args:
+            other (BloomFilter): A filter built from another data source
+                with identical hash parameters.
+
+        Returns:
+            FilterComparison: Estimates with uncertainty intervals and
+                status flags. Saturated inputs yield 'saturated' /
+                'unestimable' results instead of finite numbers.
+
+        Raises:
+            TypeError: If other is not a BloomFilter.
+            ValueError: If the hash parameters are incompatible.
+
+        Example:
+            >>> fa = BloomFilter(1000, 0.001)
+            >>> fb = BloomFilter(1000, 0.001)
+            >>> for i in range(300):
+            ...     _ = fa.add(i)
+            ...     _ = fb.add(i + 100)
+            >>> cmp = fa.compare(fb)
+            >>> 0.0 < cmp.jaccard < 1.0
+            True
+        """
+        self._check_stats_compatible(other)
+        est_a = self.estimate_cardinality()
+        est_b = other.estimate_cardinality()
+        # Bitwise OR produces a new bitmap; the originals are untouched.
+        merged = self.bitarray | other.bitarray
+        est_union = _estimate_cardinality_from_bitmap(
+            merged, self.num_slices, self.bits_per_slice)
+
+        notes = [
+            'Union cardinality is estimated from the merged (bitwise OR) '
+            'bitmap.',
+            'Intersection and Jaccard are inclusion-exclusion estimates '
+            '(|A| + |B| - |A union B|); their uncertainty exceeds the '
+            'per-filter uncertainty, especially when the true overlap is '
+            'small compared to the set sizes.',
+            'The bitwise AND of two Bloom filters is not an exact '
+            'representation of the set intersection (it carries false '
+            'positives) and is deliberately not used for these estimates.',
+        ]
+
+        if est_a.status == 'exact' and est_b.status == 'exact':
+            intersection = CardinalityEstimate(
+                estimate=0.0, lower=0.0, upper=0.0, std_error=0.0,
+                status='exact',
+                notes=('Both filters are empty; the intersection is '
+                       'exactly 0.',))
+            jaccard, jaccard_status = 1.0, 'exact'
+            notes.append('Both filters are empty; the Jaccard similarity of '
+                         'two empty sets is defined as 1.0.')
+        elif (est_a.estimate is None or est_b.estimate is None
+                or est_union.estimate is None):
+            finite = [est.estimate for est in (est_a, est_b)
+                      if est.estimate is not None]
+            intersection = CardinalityEstimate(
+                estimate=None, lower=0.0,
+                upper=min(finite) if finite else None, std_error=None,
+                status='unestimable',
+                notes=('At least one filter (or the merged union) is '
+                       'saturated, so the intersection cardinality cannot '
+                       'be estimated. It lies between 0 and the smallest '
+                       'finite set cardinality.',))
+            jaccard, jaccard_status = None, 'unestimable'
+            notes.append('Jaccard similarity cannot be estimated because '
+                         'saturation prevents a finite union or '
+                         'intersection estimate.')
+        else:
+            raw = est_a.estimate + est_b.estimate - est_union.estimate
+            # Conservative: treats the three estimates as independent,
+            # although they share bits and are positively correlated.
+            std_error = math.sqrt(
+                est_a.std_error ** 2 + est_b.std_error ** 2
+                + est_union.std_error ** 2)
+            cap = min(est_a.estimate, est_b.estimate)
+            intersection = CardinalityEstimate(
+                estimate=min(max(raw, 0.0), cap),
+                lower=max(0.0, raw - 2.0 * std_error),
+                upper=min(cap, raw + 2.0 * std_error),
+                std_error=std_error, status='estimate',
+                notes=('Inclusion-exclusion estimate clamped to '
+                       '[0, min(|A|, |B|)] so that estimation noise cannot '
+                       'produce a negative or impossible cardinality.',))
+            jaccard = min(max(raw / est_union.estimate, 0.0), 1.0) \
+                if est_union.estimate > 0 else 1.0
+            jaccard_status = 'estimate'
+
+        return FilterComparison(est_a, est_b, est_union, intersection,
+                                jaccard, jaccard_status, notes)
+
+    def estimate_union_cardinality(self, other):
+        """Estimate |A ∪ B| from the merged bitmap. See compare()."""
+        return self.compare(other).union
+
+    def estimate_intersection_cardinality(self, other):
+        """Estimate |A ∩ B| by inclusion-exclusion. See compare()."""
+        return self.compare(other).intersection
+
+    def estimate_jaccard(self, other):
+        """Estimate the Jaccard similarity |A ∩ B| / |A ∪ B|. See compare()."""
+        return self.compare(other).jaccard
 
     def tofile(self, f):
         """Serialize the Bloom filter to a file.

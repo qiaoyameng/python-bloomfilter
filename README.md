@@ -171,6 +171,52 @@ print(15 in f_intersect)  # True (in both)
 print(25 in f_intersect)  # False (only in f2)
 ```
 
+### Example 2b: Estimating Cardinalities and Overlap
+
+When two filters come from different data sources, you can estimate each
+set's cardinality, the union, the intersection, and the Jaccard similarity
+from the bit occupancy of the bitmaps. Unlike `len()` (an insertion
+counter), these are statistical estimates with uncertainty intervals:
+
+```python
+import pybloom_live
+
+f1 = pybloom_live.BloomFilter(capacity=1000, error_rate=0.001)
+f2 = pybloom_live.BloomFilter(capacity=1000, error_rate=0.001)
+
+for i in range(300):
+    f1.add(i)          # source A: 0..299
+    f2.add(i + 100)    # source B: 100..399 (100 shared with A)
+
+cmp = f1.compare(f2)
+print(cmp.cardinality_a.estimate)   # ~300
+print(cmp.union.estimate)           # ~400
+print(cmp.intersection.estimate)    # ~200
+print(cmp.jaccard)                  # ~0.5
+
+# Every estimate carries a status and an uncertainty interval:
+est = f1.estimate_cardinality()
+print(est.status)                   # 'estimate' ('exact' if empty,
+                                    #  'saturated' if all bits set)
+print(est.lower, est.upper)         # approximate 95% interval
+print(est.notes)                    # caveats: correlated hash slices,
+                                    #  finite-bit saturation, etc.
+```
+
+Notes on interpretation:
+
+- Both filters must share the same hash parameters (`num_slices`,
+  `bits_per_slice`, hash function), otherwise `compare()` raises
+  `ValueError` — bit positions would not be comparable.
+- The union is estimated from the merged (bitwise OR) bitmap; the
+  intersection and Jaccard follow by inclusion-exclusion
+  (|A| + |B| − |A ∪ B|), so their error exceeds the per-filter error.
+- The bitwise AND of two filters is **not** an exact representation of the
+  set intersection (it carries false positives) and is not used here.
+- Estimation never modifies the filters, never returns negative
+  cardinalities, and reports `'saturated'` / `'unestimable'` instead of
+  fake precision when a bitmap is (nearly) full.
+
 ### Example 3: Serialization
 
 Save and load filters from disk:

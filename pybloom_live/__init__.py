@@ -2,5 +2,5 @@
 
 """
 
-from .pybloom import BloomFilter, ScalableBloomFilter
-
+from .pybloom import (BloomFilter, CardinalityEstimate, FilterComparison,
+                      ScalableBloomFilter)

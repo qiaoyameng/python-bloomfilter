@@ -13,13 +13,16 @@ Test Coverage:
 - ScalableBloomFilter scaling behavior
 """
 import io
+import math
 import pickle
 import random
 import tempfile
 
 import pytest
 
-from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+from pybloom_live.pybloom import (BloomFilter, CardinalityEstimate,
+                                  FilterComparison, ScalableBloomFilter,
+                                  make_hashfuncs)
 
 
 # =============================================================================
@@ -1137,6 +1140,283 @@ class TestEdgeCases:
         large_string = "x" * 10000
         bf.add(large_string)
         assert large_string in bf
+
+
+# =============================================================================
+# Cardinality estimation / statistics interface
+# =============================================================================
+
+class TestCardinalityEstimation:
+    """Tests for estimate_cardinality() and the compare() statistics API.
+
+    Two complementary strategies:
+    - Fixed-seed random sets with known overlap check that estimates point
+      in the right direction and land in a reasonable range.
+    - Hand-crafted bitmaps check the deterministic boundaries of the
+      formulas (empty, single bit, saturated, nearly saturated).
+    """
+
+    @staticmethod
+    def _make_seeded_filters():
+        """Build two filters from different sources with a known overlap.
+
+        True values: |A| = |B| = 300, |A union B| = 500, |A intersect B| =
+        100, Jaccard = 0.2.
+        """
+        rng = random.Random(20261002)
+        common = rng.sample(range(100000), 100)
+        only_a = rng.sample(range(100000, 200000), 200)
+        only_b = rng.sample(range(200000, 300000), 200)
+        filter_a = BloomFilter(capacity=500, error_rate=0.001)
+        filter_b = BloomFilter(capacity=500, error_rate=0.001)
+        for key in common + only_a:
+            filter_a.add(key)
+        for key in common + only_b:
+            filter_b.add(key)
+        truth = {'a': 300, 'b': 300, 'union': 500,
+                 'intersection': 100, 'jaccard': 0.2}
+        return filter_a, filter_b, truth
+
+    # ------------------------------------------------------------------
+    # Fixed-seed sets with known overlap: direction and reasonable range
+    # ------------------------------------------------------------------
+
+    def test_known_overlap_direction_and_range(self):
+        """Estimates must point the right way and stay near the truth."""
+        filter_a, filter_b, truth = self._make_seeded_filters()
+        cmp = filter_a.compare(filter_b)
+
+        # Individual cardinalities in a reasonable range around 300.
+        assert 240 < cmp.cardinality_a.estimate < 360
+        assert 240 < cmp.cardinality_b.estimate < 360
+        assert cmp.cardinality_a.status == 'estimate'
+
+        # Union dominates each input and stays near 500.
+        assert cmp.union.estimate > cmp.cardinality_a.estimate
+        assert cmp.union.estimate > cmp.cardinality_b.estimate
+        assert 400 < cmp.union.estimate < 600
+
+        # Intersection bounded by the smaller set, near 100.
+        assert 0 <= cmp.intersection.estimate <= min(
+            cmp.cardinality_a.estimate, cmp.cardinality_b.estimate)
+        assert 0 < cmp.intersection.estimate < 200
+
+        # Jaccard in (0, 1) and near the true 0.2.
+        assert cmp.jaccard_status == 'estimate'
+        assert 0.0 < cmp.jaccard < 0.5
+
+        # Uncertainty intervals bracket the true values.
+        assert cmp.cardinality_a.lower <= truth['a'] <= cmp.cardinality_a.upper
+        assert cmp.union.lower <= truth['union'] <= cmp.union.upper
+        assert (cmp.intersection.lower <= truth['intersection']
+                <= cmp.intersection.upper)
+
+    def test_known_overlap_per_slice_spread(self):
+        """Per-slice estimates exist and cluster around the pooled value."""
+        filter_a, _, truth = self._make_seeded_filters()
+        est = filter_a.estimate_cardinality()
+        per_slice = est.per_slice_estimates
+        assert len(per_slice) == filter_a.num_slices
+        assert all(math.isfinite(value) for value in per_slice)
+        # Every slice estimate is within ~20% of the truth (no wild slice).
+        for value in per_slice:
+            assert abs(value - truth['a']) < 0.2 * truth['a']
+
+    # ------------------------------------------------------------------
+    # Hand-crafted bitmaps: deterministic formula boundaries
+    # ------------------------------------------------------------------
+
+    def test_empty_filter_is_exact_zero(self):
+        """Empty bitmap -> exact 0, not an estimate."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        est = bf.estimate_cardinality()
+        assert est.status == 'exact'
+        assert est.estimate == 0.0
+        assert est.lower == 0.0
+        assert est.upper == 0.0
+        assert est.fill == 0.0
+
+    def test_all_bits_set_is_saturated_not_exact(self):
+        """Full bitmap -> no finite estimate, only a positive lower bound."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        bf.bitarray.setall(True)
+        est = bf.estimate_cardinality()
+        assert est.status == 'saturated'
+        assert est.estimate is None
+        assert est.upper is None
+        assert est.lower > 0
+        # Lower bound equals the estimate one unset bit would produce.
+        expected = bf.bits_per_slice * math.log(bf.num_bits)
+        assert est.lower == pytest.approx(expected)
+
+    def test_single_bit_matches_closed_form(self):
+        """One set bit -> exact closed-form occupancy estimate."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        bf.bitarray[0] = True
+        est = bf.estimate_cardinality()
+        expected = -bf.bits_per_slice * math.log1p(-1.0 / bf.num_bits)
+        assert est.status == 'estimate'
+        assert est.estimate == pytest.approx(expected)
+        assert est.set_bits == 1
+        assert est.total_bits == bf.num_bits
+        assert len(est.per_slice_estimates) == bf.num_slices
+        # The slice holding the bit carries the whole estimate.
+        assert est.per_slice_estimates[0] == pytest.approx(
+            -bf.bits_per_slice * math.log1p(-1.0 / bf.bits_per_slice))
+        assert est.per_slice_estimates[1] == 0.0
+
+    def test_nearly_saturated_gives_wide_interval_not_exact(self):
+        """Almost-full bitmap -> finite estimate with huge uncertainty."""
+        bf = BloomFilter(capacity=100, error_rate=0.01)
+        bf.bitarray.setall(True)
+        bf.bitarray[0] = False
+        est = bf.estimate_cardinality()
+        assert est.status == 'estimate'
+        assert est.estimate is not None and est.estimate > 0
+        # The relative uncertainty is huge (a healthy filter has a relative
+        # standard error of a few percent at most).
+        assert est.std_error > 0.1 * est.estimate
+        assert any('saturat' in note for note in est.notes)
+
+    def test_identical_filters_give_jaccard_one(self):
+        """Two identical filters -> intersection == union, Jaccard == 1."""
+        filter_a = BloomFilter(capacity=100, error_rate=0.01)
+        filter_b = BloomFilter(capacity=100, error_rate=0.01)
+        for char in 'abcdefghij':
+            filter_a.add(char)
+            filter_b.add(char)
+        cmp = filter_a.compare(filter_b)
+        assert cmp.jaccard == 1.0
+        assert cmp.intersection.estimate == pytest.approx(
+            cmp.union.estimate)
+        assert cmp.union.estimate == pytest.approx(
+            cmp.cardinality_a.estimate)
+
+    def test_disjoint_filters_give_small_jaccard(self):
+        """Disjoint sets -> near-zero intersection and Jaccard."""
+        filter_a = BloomFilter(capacity=1000, error_rate=0.001)
+        filter_b = BloomFilter(capacity=1000, error_rate=0.001)
+        for i in range(100):
+            filter_a.add('a-%d' % i)
+            filter_b.add('b-%d' % i)
+        cmp = filter_a.compare(filter_b)
+        assert cmp.intersection.estimate >= 0
+        assert cmp.jaccard < 0.1
+
+    def test_both_empty_filters(self):
+        """Two empty filters -> exact zero intersection, Jaccard 1."""
+        filter_a = BloomFilter(capacity=100, error_rate=0.01)
+        filter_b = BloomFilter(capacity=100, error_rate=0.01)
+        cmp = filter_a.compare(filter_b)
+        assert cmp.union.estimate == 0.0
+        assert cmp.union.status == 'exact'
+        assert cmp.intersection.estimate == 0.0
+        assert cmp.intersection.status == 'exact'
+        assert cmp.jaccard == 1.0
+        assert cmp.jaccard_status == 'exact'
+
+    def test_saturated_pair_is_unestimable(self):
+        """Two full bitmaps -> no fake numbers, explicit unestimable state."""
+        filter_a = BloomFilter(capacity=100, error_rate=0.01)
+        filter_b = BloomFilter(capacity=100, error_rate=0.01)
+        filter_a.bitarray.setall(True)
+        filter_b.bitarray.setall(True)
+        cmp = filter_a.compare(filter_b)
+        assert cmp.union.status == 'saturated'
+        assert cmp.union.estimate is None
+        assert cmp.intersection.status == 'unestimable'
+        assert cmp.intersection.estimate is None
+        assert cmp.intersection.lower == 0.0
+        assert cmp.jaccard is None
+        assert cmp.jaccard_status == 'unestimable'
+
+    def test_one_saturated_filter_bounds_intersection(self):
+        """One full bitmap -> intersection bounded by the other filter."""
+        filter_a = BloomFilter(capacity=100, error_rate=0.01)
+        filter_b = BloomFilter(capacity=100, error_rate=0.01)
+        filter_a.bitarray.setall(True)
+        for char in 'abcde':
+            filter_b.add(char)
+        cmp = filter_a.compare(filter_b)
+        assert cmp.intersection.status == 'unestimable'
+        assert cmp.intersection.estimate is None
+        assert cmp.intersection.lower == 0.0
+        assert cmp.intersection.upper == pytest.approx(
+            cmp.cardinality_b.estimate)
+
+    def test_intersection_never_negative_or_impossible(self):
+        """Random filter pairs: estimates stay within [0, min(|A|, |B|)]."""
+        rng = random.Random(7)
+        for _ in range(20):
+            filter_a = BloomFilter(capacity=200, error_rate=0.01)
+            filter_b = BloomFilter(capacity=200, error_rate=0.01)
+            for _ in range(rng.randrange(0, 150)):
+                filter_a.add(rng.randrange(100000))
+            for _ in range(rng.randrange(0, 150)):
+                filter_b.add(rng.randrange(100000))
+            cmp = filter_a.compare(filter_b)
+            cap = min(cmp.cardinality_a.estimate, cmp.cardinality_b.estimate)
+            assert cmp.intersection.estimate >= 0
+            assert cmp.intersection.estimate <= cap + 1e-9
+            assert cmp.intersection.lower >= 0
+            assert 0.0 <= cmp.jaccard <= 1.0
+
+    # ------------------------------------------------------------------
+    # API guarantees
+    # ------------------------------------------------------------------
+
+    def test_statistics_do_not_modify_filters(self):
+        """Estimation must be read-only on both filters."""
+        filter_a, filter_b, _ = self._make_seeded_filters()
+        bits_a = filter_a.bitarray.tobytes()
+        bits_b = filter_b.bitarray.tobytes()
+        count_a, count_b = filter_a.count, filter_b.count
+
+        filter_a.compare(filter_b)
+        filter_a.estimate_cardinality()
+        filter_b.estimate_cardinality()
+        filter_a.estimate_union_cardinality(filter_b)
+        filter_a.estimate_intersection_cardinality(filter_b)
+        filter_a.estimate_jaccard(filter_b)
+
+        assert filter_a.bitarray.tobytes() == bits_a
+        assert filter_b.bitarray.tobytes() == bits_b
+        assert filter_a.count == count_a
+        assert filter_b.count == count_b
+
+    def test_incompatible_hash_parameters_raise(self):
+        """Filters with different hash layouts cannot be compared."""
+        filter_a = BloomFilter(capacity=100, error_rate=0.01)
+        # Different error rate -> different num_slices.
+        filter_b = BloomFilter(capacity=100, error_rate=0.001)
+        with pytest.raises(ValueError):
+            filter_a.compare(filter_b)
+        # Different capacity -> different bits_per_slice.
+        filter_c = BloomFilter(capacity=1000, error_rate=0.01)
+        with pytest.raises(ValueError):
+            filter_a.compare(filter_c)
+        with pytest.raises(TypeError):
+            filter_a.compare(object())
+
+    def test_comparison_notes_explain_uncertainty(self):
+        """Estimates ship with human-readable uncertainty caveats."""
+        filter_a, filter_b, _ = self._make_seeded_filters()
+        cmp = filter_a.compare(filter_b)
+        assert cmp.notes
+        assert any('inclusion-exclusion' in note for note in cmp.notes)
+        assert any('false' in note for note in cmp.notes)
+        est = filter_a.estimate_cardinality()
+        assert any('correlated' in note for note in est.notes)
+
+    def test_result_objects_repr(self):
+        """Result objects render compactly for interactive use."""
+        filter_a, filter_b, _ = self._make_seeded_filters()
+        cmp = filter_a.compare(filter_b)
+        assert 'CardinalityEstimate' in repr(cmp.cardinality_a)
+        assert 'FilterComparison' in repr(cmp)
+        saturated = BloomFilter(capacity=100, error_rate=0.01)
+        saturated.bitarray.setall(True)
+        assert 'saturated' in repr(saturated.estimate_cardinality())
 
 
 if __name__ == '__main__':
