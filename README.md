@@ -111,6 +111,49 @@ print(10000 in sbf)  # False
 - `SMALL_SET_GROWTH = 2`: Slower growth, uses less memory
 - `LARGE_SET_GROWTH = 4`: Faster growth (default), better for large datasets
 
+### CountingBloomFilter
+
+The `CountingBloomFilter` supports undoing individual insertions. Instead of
+unsafe "delete by key" (which can corrupt other entries in a counting
+filter), every insertion returns an opaque credential, and only that
+credential can revoke that exact insertion:
+
+```python
+import pybloom_live
+
+cbf = pybloom_live.CountingBloomFilter(
+    capacity=1000,
+    error_rate=0.001,
+    max_credentials=1000,  # bound on the active credential table
+    counter_bits=8,        # per-counter width: 8, 16, 32, or 64
+)
+
+token = cbf.add("apple")   # opaque bytes; one credential per insertion
+token2 = cbf.add("apple")  # same key again -> independent credential
+
+cbf.revoke(token)          # undoes only the first insertion
+print("apple" in cbf)      # True: token2's contribution remains
+cbf.revoke(token2)
+print("apple" in cbf)      # False
+```
+
+**Safety properties:**
+
+- Credentials are bound to the filter's random epoch/secret and to the exact
+  counter positions via HMAC: forged credentials, credentials from another
+  filter, and already-revoked credentials raise `InvalidCredentialError`
+  without changing any state.
+- Counter overflow rejects the *entire* insertion atomically
+  (`CounterOverflowError`) before any counter is touched, so a later revoke
+  can never decrement a saturated counter to a wrong zero.
+- The credential table is bounded by `max_credentials`
+  (`CredentialTableFullError` when full; `None` = unbounded, default =
+  `capacity`). Inspect costs via `cbf.counter_bytes`,
+  `cbf.credential_table_bytes`, and `cbf.persistent_bytes()` (exact size of
+  `tofile` output).
+- `tofile`/`fromfile` and pickling preserve both the counters and the
+  validity of outstanding credentials across save/load.
+
 ## Examples
 
 ### Example 1: Web Crawler - Tracking Visited URLs
