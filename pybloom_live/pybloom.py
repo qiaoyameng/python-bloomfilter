@@ -23,6 +23,8 @@ Requirements:
 import copy
 import hashlib
 import math
+import threading
+import time
 from io import BytesIO
 from struct import calcsize, pack, unpack
 
@@ -1000,6 +1002,302 @@ class ScalableBloomFilter:
             100
         """
         return sum(f.count for f in self.filters)
+
+
+class RollingBloomFilter:
+    """A time-windowed Bloom filter built from a fixed ring of time slices.
+
+    Designed for crawl deduplication where only "seen recently" matters and
+    the filter must not grow without bound. The filter consists of a fixed
+    number of time slices (``num_slices``), each a plain BloomFilter covering
+    ``slice_seconds = window_seconds / num_slices`` of wall time. Inserts
+    always land in the slice for the current time; membership queries take
+    the union over all currently valid slices.
+
+    Retention Semantics (per key, NOT an exact TTL):
+        - Guaranteed minimum retention: ``(num_slices - 1) * slice_seconds``
+          (i.e. ``window_seconds * (num_slices - 1) / num_slices``). A key
+          inserted just before a slice boundary is dropped once that many
+          seconds have elapsed.
+        - Maximum retention: ``num_slices * slice_seconds``
+          (i.e. ``window_seconds``), approached but never reached. A key
+          inserted just after a slice boundary lives almost a full extra
+          slice beyond the minimum.
+        - Therefore the maximum *extra* retention beyond the guaranteed
+          minimum is exactly one ``slice_seconds``. Keys expire only at
+          slice granularity; there is no per-key exact TTL.
+
+    Refresh-on-hit:
+        ``add()`` always writes the key into the *current* slice, even when
+        the key already hits in an older slice. Without this, a key whose
+        only copy lives in an expiring slice would be forgotten as soon as
+        that slice rotates out, even though it was just seen again.
+
+    Rotation:
+        Rotation is lazy and happens on access. When the clock advances into
+        a new slice, the ring slot for that slice is cleared *before* it is
+        reused, so a freshly reused slice never has its new data wiped by a
+        later rotation. Jumps across multiple slices (including jumps larger
+        than the whole ring) are handled: every stale slot is discarded.
+
+    Clock:
+        The clock is injectable (any callable returning seconds since the
+        epoch) to allow deterministic testing. If the clock moves backwards,
+        time is treated as standing still (the current slice index is
+        clamped to its high-water mark); no data is discarded on rewind.
+
+    False Positive Budget:
+        ``error_rate`` is the budget for the whole window. It is divided
+        equally across the ``num_slices`` slices (each slice gets
+        ``error_rate / num_slices``), so by the union bound the combined
+        false positive rate of a query stays within ``error_rate``.
+
+    Persistence:
+        ``tofile()``/``fromfile()`` serialize all slices together with their
+        slice indices. After restoring, normal lazy rotation discards slices
+        that expired while the process was down.
+
+    Thread Safety:
+        All public operations are serialized with a simple lock.
+    """
+
+    FILE_FMT = b'<ddQQq'   # error_rate, slice_seconds, num_slices, capacity, current_index
+    SLOT_FMT = b'<qQ'      # slice_id (-1 == empty), per-slot insert count
+
+    def __init__(self, capacity, error_rate=0.001, window_seconds=3600.0,
+                 num_slices=6, clock=None):
+        """Initialize a rolling Bloom filter.
+
+        Args:
+            capacity (int): Expected number of distinct keys per slice. Size
+                the filter for the busiest slice, not the whole window.
+            error_rate (float): Total false positive budget for a membership
+                query across the whole window. Each of the ``num_slices``
+                slices is built with ``error_rate / num_slices``.
+            window_seconds (float): Total span of the retention window.
+                Keys are retained at least
+                ``window_seconds * (num_slices - 1) / num_slices`` and less
+                than ``window_seconds``.
+            num_slices (int): Number of time slices in the ring. Must be >= 2.
+            clock (callable, optional): Returns current time in seconds.
+                Defaults to ``time.time``. Inject a fake clock for tests.
+
+        Raises:
+            ValueError: If num_slices < 2, window_seconds <= 0, or the
+                underlying BloomFilter parameters are invalid.
+        """
+        if num_slices < 2:
+            raise ValueError("num_slices must be >= 2")
+        if not window_seconds > 0:
+            raise ValueError("window_seconds must be > 0")
+
+        self.window_seconds = float(window_seconds)
+        self.num_slices = int(num_slices)
+        self.slice_seconds = float(window_seconds) / self.num_slices
+        self.capacity = capacity
+        self.error_rate = error_rate
+        self._clock = clock if clock is not None else time.time
+        self._lock = threading.Lock()
+        self._setup_slices(0)
+
+    def _setup_slices(self, current_index):
+        """(Re)create the ring of per-slice filters and metadata."""
+        per_slice_error = self.error_rate / self.num_slices
+        self._filters = [
+            BloomFilter(self.capacity, per_slice_error)
+            for _ in range(self.num_slices)
+        ]
+        self._slice_ids = [None] * self.num_slices
+        self._counts = [0] * self.num_slices
+        self._current_index = current_index
+
+    @property
+    def min_retention_seconds(self):
+        """Guaranteed minimum time a key remains visible after insertion."""
+        return (self.num_slices - 1) * self.slice_seconds
+
+    @property
+    def max_extra_retention_seconds(self):
+        """Maximum retention beyond the guaranteed minimum (one slice)."""
+        return self.slice_seconds
+
+    def _index_for(self, timestamp):
+        """Map a timestamp to its absolute slice index (floor division)."""
+        return int(timestamp // self.slice_seconds)
+
+    def _advance(self):
+        """Rotate the ring forward to the current time. Caller holds lock.
+
+        Clears each newly entered slice's slot before reuse. Handles jumps
+        across multiple slices and clamps backwards clock movement.
+        """
+        index = self._index_for(self._clock())
+        if index < self._current_index:
+            # Clock moved backwards: stand still, keep existing data.
+            index = self._current_index
+        if index - self._current_index >= self.num_slices:
+            # Jumped past the whole ring: everything is stale.
+            self._slice_ids = [None] * self.num_slices
+            self._counts = [0] * self.num_slices
+        else:
+            for entered in range(self._current_index + 1, index + 1):
+                slot = entered % self.num_slices
+                if self._slice_ids[slot] is not None:
+                    self._slice_ids[slot] = None
+                    self._counts[slot] = 0
+        self._current_index = index
+        slot = index % self.num_slices
+        if self._slice_ids[slot] != index:
+            # Claim the slot for the current slice, clearing stale bits.
+            self._filters[slot].bitarray.setall(False)
+            self._slice_ids[slot] = index
+            self._counts[slot] = 0
+
+    def _valid_slots(self):
+        """Yield slots holding slices still inside the retention window."""
+        oldest = self._current_index - (self.num_slices - 1)
+        for slot in range(self.num_slices):
+            slice_id = self._slice_ids[slot]
+            if slice_id is not None and slice_id >= oldest:
+                yield slot
+
+    def _contains_unlocked(self, key):
+        """Membership test over the union of valid slices. Caller holds lock."""
+        for slot in self._valid_slots():
+            if key in self._filters[slot]:
+                return True
+        return False
+
+    def __contains__(self, key):
+        """Test whether a key was added within the retention window.
+
+        Returns True if the key is present in any valid slice (with the
+        usual Bloom filter false positive caveat), False if it is definitely
+        absent from all of them.
+        """
+        with self._lock:
+            self._advance()
+            return self._contains_unlocked(key)
+
+    def add(self, key):
+        """Add a key, refreshing it into the current slice.
+
+        The key is always written to the current slice, even if it already
+        hits in an older slice, so that recently seen keys survive rotation
+        of the older slice.
+
+        Args:
+            key: The element to add.
+
+        Returns:
+            bool: True if the key was already present in some valid slice
+                before this call (possible false positive), False if this is
+                definitely a new key within the window.
+        """
+        with self._lock:
+            self._advance()
+            already_present = self._contains_unlocked(key)
+            slot = self._current_index % self.num_slices
+            filt = self._filters[slot]
+            bitarray_ = filt.bitarray
+            bits_per_slice = filt.bits_per_slice
+            offset = 0
+            for k in filt.make_hashes(key):
+                bitarray_[offset + k] = True
+                offset += bits_per_slice
+            if not already_present:
+                self._counts[slot] += 1
+            return already_present
+
+    def __len__(self):
+        """Return the number of insertions across all valid slices.
+
+        This counts insertions, not unique keys; a key refreshed in multiple
+        slices is counted once per slice it was written to.
+        """
+        with self._lock:
+            self._advance()
+            return sum(self._counts[slot] for slot in self._valid_slots())
+
+    def tofile(self, f):
+        """Serialize the filter (all slices and rotation state) to a file.
+
+        Args:
+            f: File-like object opened in binary write mode ('wb'), or a
+                BytesIO instance.
+        """
+        with self._lock:
+            self._advance()
+            f.write(pack(self.FILE_FMT, self.error_rate, self.slice_seconds,
+                         self.num_slices, self.capacity, self._current_index))
+            for slot in range(self.num_slices):
+                slice_id = self._slice_ids[slot]
+                f.write(pack(self.SLOT_FMT,
+                             -1 if slice_id is None else slice_id,
+                             self._counts[slot]))
+            for filt in self._filters:
+                if isinstance(f, BytesIO):
+                    f.write(filt.bitarray.tobytes())
+                else:
+                    filt.bitarray.tofile(f)
+
+    @classmethod
+    def fromfile(cls, f, clock=None):
+        """Restore a filter previously saved with tofile().
+
+        Slices that expired while the filter was persisted are discarded
+        lazily by normal rotation on the next operation.
+
+        Args:
+            f: File-like object opened in binary read mode ('rb'), or a
+                BytesIO instance positioned at the start of the data.
+            clock (callable, optional): Clock for the restored filter.
+                Defaults to ``time.time``.
+
+        Returns:
+            RollingBloomFilter: The restored filter.
+        """
+        (error_rate, slice_seconds, num_slices, capacity,
+         current_index) = unpack(cls.FILE_FMT, f.read(calcsize(cls.FILE_FMT)))
+
+        instance = cls.__new__(cls)
+        instance.window_seconds = slice_seconds * num_slices
+        instance.num_slices = num_slices
+        instance.slice_seconds = slice_seconds
+        instance.capacity = capacity
+        instance.error_rate = error_rate
+        instance._clock = clock if clock is not None else time.time
+        instance._lock = threading.Lock()
+        instance._setup_slices(current_index)
+
+        for slot in range(num_slices):
+            slice_id, count = unpack(cls.SLOT_FMT, f.read(calcsize(cls.SLOT_FMT)))
+            instance._slice_ids[slot] = None if slice_id < 0 else slice_id
+            instance._counts[slot] = count
+
+        num_bytes = -(-instance._filters[0].num_bits // 8)
+        for slot in range(num_slices):
+            data = bitarray.bitarray(endian='little')
+            if isinstance(f, BytesIO):
+                data.frombytes(f.read(num_bytes))
+            else:
+                data.fromfile(f, num_bytes)
+            instance._filters[slot].bitarray = data
+
+        return instance
+
+    def __getstate__(self):
+        """Prepare state for pickling (clock and lock are not picklable)."""
+        state = self.__dict__.copy()
+        del state['_clock']
+        del state['_lock']
+        return state
+
+    def __setstate__(self, state):
+        """Restore from pickling; clock resets to time.time."""
+        self.__dict__.update(state)
+        self._clock = time.time
+        self._lock = threading.Lock()
 
 
 if __name__ == "__main__":

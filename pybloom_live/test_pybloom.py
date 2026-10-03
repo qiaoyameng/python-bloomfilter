@@ -13,13 +13,19 @@ Test Coverage:
 - ScalableBloomFilter scaling behavior
 """
 import io
+import os
 import pickle
 import random
 import tempfile
 
 import pytest
 
-from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+from pybloom_live.pybloom import (
+    BloomFilter,
+    RollingBloomFilter,
+    ScalableBloomFilter,
+    make_hashfuncs,
+)
 
 
 # =============================================================================
@@ -1137,6 +1143,313 @@ class TestEdgeCases:
         large_string = "x" * 10000
         bf.add(large_string)
         assert large_string in bf
+
+
+class FakeClock:
+    """Deterministic, manually advanced clock for RollingBloomFilter tests."""
+
+    def __init__(self, now=0.0):
+        self.now = float(now)
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def rewind(self, seconds):
+        self.now -= seconds
+
+
+class TestRollingBloomFilter:
+    """Tests for the time-sliced rolling Bloom filter.
+
+    All tests use a FakeClock; none of them wait on real wall-clock time.
+    Default test geometry: window=3600s, num_slices=6 -> slice=600s,
+    guaranteed minimum retention 3000s, max extra retention 600s.
+    """
+
+    SLICE = 600.0
+
+    def make_filter(self, clock, capacity=1000, error_rate=1e-6,
+                    window_seconds=3600.0, num_slices=6):
+        return RollingBloomFilter(
+            capacity=capacity,
+            error_rate=error_rate,
+            window_seconds=window_seconds,
+            num_slices=num_slices,
+            clock=clock,
+        )
+
+    def test_retention_bounds_documented(self):
+        """Minimum retention and maximum extra retention are explicit."""
+        clock = FakeClock()
+        rbf = self.make_filter(clock)
+        assert rbf.min_retention_seconds == 3000.0  # (6 - 1) * 600
+        assert rbf.max_extra_retention_seconds == 600.0  # one slice
+        assert rbf.min_retention_seconds + rbf.max_extra_retention_seconds == \
+            rbf.window_seconds
+
+    def test_same_key_replayed_across_two_slices(self):
+        """Re-adding a key in a later slice keeps it alive after the old
+        slice rotates out (refresh-on-hit semantics)."""
+        clock = FakeClock(now=590.0)  # slice 0, near its end
+        rbf = self.make_filter(clock)
+
+        assert rbf.add("url-A") is False  # first sighting, in slice 0
+
+        clock.advance(20.0)  # t=610 -> slice 1
+        assert rbf.add("url-A") is True  # still hits via old slice 0
+
+        # t=3601: slice 0 has rotated out; only the refreshed copy in
+        # slice 1 can keep the key alive.
+        clock.now = 3601.0
+        assert "url-A" in rbf
+
+        # Slice 1 itself expires once the current index reaches 1 + 6 = 7,
+        # i.e. t >= 4200. Just before that the key must still be present.
+        clock.now = 4199.9
+        assert "url-A" in rbf
+
+        clock.now = 4200.0
+        assert "url-A" not in rbf
+
+    def test_minimum_retention_guaranteed(self):
+        """A key survives at least (num_slices - 1) * slice_seconds."""
+        clock = FakeClock(now=self.SLICE)  # exactly at start of slice 1
+        rbf = self.make_filter(clock)
+        rbf.add("url-B")
+
+        # Worst case is insertion just before a boundary; insertion right
+        # after one lives longest. Either way it must survive 3000s.
+        clock.now = self.SLICE + 3000.0 - 0.1
+        assert "url-B" in rbf
+
+    def test_maximum_retention_never_exceeds_window(self):
+        """Even the luckiest insert (right after a boundary) is gone once
+        window_seconds have elapsed."""
+        clock = FakeClock(now=self.SLICE)  # start of slice 1
+        rbf = self.make_filter(clock)
+        rbf.add("url-C")
+
+        clock.now = self.SLICE + 3600.0  # slice index 7, slice 1 expired
+        assert "url-C" not in rbf
+
+    def test_insert_exactly_on_boundary_lands_in_new_slice(self):
+        """t == k * slice_seconds belongs to slice k, not k - 1."""
+        clock = FakeClock(now=599.999)
+        rbf = self.make_filter(clock)
+        rbf.add("before-boundary")
+        assert rbf._slice_ids[0] == 0
+
+        clock.now = 600.0  # exact boundary
+        rbf.add("on-boundary")
+        assert rbf._slice_ids[1] == 1
+
+        # The boundary key must survive exactly as long as slice 1 does.
+        clock.now = 4199.9
+        assert "on-boundary" in rbf
+        assert "before-boundary" not in rbf  # slice 0 expired at t=3600
+
+    def test_jump_across_many_slices(self):
+        """A clock jump larger than the whole ring discards everything."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        for i in range(10):
+            rbf.add("url-%d" % i)
+        assert len(rbf) == 10
+
+        clock.advance(10 * self.SLICE)  # jump 10 slices (> 6-slot ring)
+        assert len(rbf) == 0
+        for i in range(10):
+            assert ("url-%d" % i) not in rbf
+
+        # Filter still works after the jump.
+        assert rbf.add("url-new") is False
+        assert "url-new" in rbf
+
+    def test_jump_across_a_few_slices(self):
+        """A jump of 2+ slices (but less than the ring) expires only the
+        slices that were skipped past."""
+        clock = FakeClock(now=0.0)  # slice 0
+        rbf = self.make_filter(clock)
+        rbf.add("old")
+
+        clock.now = 2 * self.SLICE  # skip slice 1 entirely
+        assert "old" in rbf  # slice 0 still inside the 6-slice window
+
+        clock.now = 6 * self.SLICE  # slice 0 now expired
+        assert "old" not in rbf
+
+    def test_clock_rewind_stands_still(self):
+        """Backwards clock movement must not discard or resurrect data."""
+        clock = FakeClock(now=2 * self.SLICE)  # slice 2
+        rbf = self.make_filter(clock)
+        rbf.add("before-rewind")
+
+        clock.rewind(2 * self.SLICE)  # back to t=0 (slice 0)
+        assert "before-rewind" in rbf  # nothing discarded on rewind
+        assert rbf.add("during-rewind") is False
+        assert "during-rewind" in rbf
+
+        # While rewound, time stands still: no rotation happens.
+        assert rbf._current_index == 2
+
+        # Clock catches back up; normal rotation resumes.
+        clock.now = 3 * self.SLICE
+        assert "before-rewind" in rbf
+        assert "during-rewind" in rbf
+
+    def test_rotation_does_not_wipe_reused_slot(self):
+        """Data written into a freshly reused ring slot survives later
+        rotations of other slots."""
+        clock = FakeClock(now=0.0)  # slice 0 -> slot 0
+        rbf = self.make_filter(clock)
+        rbf.add("ancient")
+
+        clock.now = 6 * self.SLICE  # slice 6 -> slot 0 reused, cleared first
+        assert "ancient" not in rbf
+        rbf.add("fresh")
+
+        # Rotate several other slots; slot 0's new data must be untouched.
+        for step in range(7, 12):
+            clock.now = step * self.SLICE
+            assert "fresh" in rbf
+
+        # And it expires exactly when slice 6 leaves the window.
+        clock.now = 12 * self.SLICE
+        assert "fresh" not in rbf
+
+    def test_add_return_value(self):
+        """add() reports prior presence within the window only."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        assert rbf.add("dup") is False
+        assert rbf.add("dup") is True
+
+        clock.now = 6 * self.SLICE  # everything expired
+        assert rbf.add("dup") is False  # treated as new again
+
+    def test_len_counts_only_valid_slices(self):
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        rbf.add("a")
+        rbf.add("b")
+        clock.now = self.SLICE
+        rbf.add("c")
+        assert len(rbf) == 3
+
+        clock.now = 6 * self.SLICE  # slice 0 (a, b) expired
+        assert len(rbf) == 1
+
+    def test_error_budget_split_across_slices(self):
+        """The total FP budget is divided equally among the slices."""
+        clock = FakeClock()
+        rbf = self.make_filter(clock, error_rate=0.006, num_slices=6)
+        for filt in rbf._filters:
+            assert filt.error_rate == pytest.approx(0.001)
+
+    def test_union_query_spans_valid_slices(self):
+        """Keys inserted in different slices are all found by one query."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        rbf.add("slice-0-key")
+        clock.now = self.SLICE
+        rbf.add("slice-1-key")
+        clock.now = 2 * self.SLICE
+        rbf.add("slice-2-key")
+
+        assert "slice-0-key" in rbf
+        assert "slice-1-key" in rbf
+        assert "slice-2-key" in rbf
+
+    def test_persistence_roundtrip(self):
+        """Saved and restored filters keep data and rotation state."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        rbf.add("persisted-0")
+        clock.now = self.SLICE
+        rbf.add("persisted-1")
+
+        buffer = io.BytesIO()
+        rbf.tofile(buffer)
+        buffer.seek(0)
+
+        restored = RollingBloomFilter.fromfile(buffer, clock=clock)
+        assert "persisted-0" in restored
+        assert "persisted-1" in restored
+        assert len(restored) == 2
+
+        # Rotation continues correctly after restore.
+        clock.now = 6 * self.SLICE  # slice 0 expired
+        assert "persisted-0" not in restored
+        assert "persisted-1" in restored
+
+    def test_persistence_expiry_while_offline(self):
+        """Slices that expired while persisted are gone after restore."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        rbf.add("stale")
+
+        buffer = io.BytesIO()
+        rbf.tofile(buffer)
+        buffer.seek(0)
+
+        clock.now = 100 * self.SLICE  # process was down for a long time
+        restored = RollingBloomFilter.fromfile(buffer, clock=clock)
+        assert "stale" not in restored
+        assert len(restored) == 0
+
+    def test_persistence_to_real_file(self):
+        """tofile/fromfile also work with real binary files."""
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock)
+        rbf.add("on-disk")
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            path = tmp.name
+        try:
+            with open(path, 'wb') as f:
+                rbf.tofile(f)
+            with open(path, 'rb') as f:
+                restored = RollingBloomFilter.fromfile(f, clock=clock)
+            assert "on-disk" in restored
+        finally:
+            os.remove(path)
+
+    def test_invalid_arguments(self):
+        """Bad geometry is rejected up front."""
+        with pytest.raises(ValueError):
+            RollingBloomFilter(capacity=100, num_slices=1)
+        with pytest.raises(ValueError):
+            RollingBloomFilter(capacity=100, window_seconds=0)
+        with pytest.raises(ValueError):
+            RollingBloomFilter(capacity=100, window_seconds=-5)
+        with pytest.raises(ValueError):
+            RollingBloomFilter(capacity=0)
+
+    def test_concurrent_adds_and_queries(self):
+        """Simple-lock thread safety: concurrent users see consistent data."""
+        import threading
+
+        clock = FakeClock(now=0.0)
+        rbf = self.make_filter(clock, capacity=2000)
+
+        def worker(offset):
+            for i in range(100):
+                rbf.add("key-%d-%d" % (offset, i))
+
+        threads = [threading.Thread(target=worker, args=(t,))
+                   for t in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        for t in range(4):
+            for i in range(100):
+                assert ("key-%d-%d" % (t, i)) in rbf
+        assert len(rbf) == 400
 
 
 if __name__ == '__main__':

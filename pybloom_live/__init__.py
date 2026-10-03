@@ -2,5 +2,4 @@
 
 """
 
-from .pybloom import BloomFilter, ScalableBloomFilter
-
+from .pybloom import BloomFilter, RollingBloomFilter, ScalableBloomFilter
