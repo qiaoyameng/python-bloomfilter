@@ -191,10 +191,67 @@ with open('bloom_filter.bin', 'wb') as f:
 with open('bloom_filter.bin', 'rb') as f:
     loaded_bf = pybloom_live.BloomFilter.fromfile(f)
 
+# Old v4 files must be requested explicitly:
+# pybloom_live.BloomFilter.fromfile(f, legacy=True)
+
 # Verify
 print("user_500" in loaded_bf)    # True
 print("user_9999" in loaded_bf)   # False
 ```
+
+### Portable File Format (v1)
+
+`tofile()` writes a versioned, self-delimiting binary frame. The frame records
+the key encoding (UTF-8 for strings, identity bytes for bytes-like keys),
+little-endian integer unpacking, LSB-first bit order, selected hash algorithm
+and version, deterministic salts, slice count, bits per slice, capacity,
+count, effective bit count, payload length, and CRC32 checksum.
+
+Each call to `fromfile()` consumes exactly one object, so multiple filters can
+be concatenated in one stream. Truncated payloads, non-zero padding bits,
+checksum failures, parameter/formula mismatches, and unsupported limits are
+rejected. The old v4 binary layout is read only with `legacy=True`; the reader
+never guesses an unknown file as legacy because doing so could restore a filter
+that produces false negatives.
+
+**Bloom frame layout (all integers are little-endian):**
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 4 | Magic `PBLF` |
+| 4 | 1 | Format version (`1`) |
+| 5 | 1 | Key codec (`1`: UTF-8 strings, identity bytes-like keys) |
+| 6 | 1 | Integer byte order (`1`: little-endian) |
+| 7 | 1 | Bit order (`1`: least-significant bit first) |
+| 8 | 1 | Hash algorithm (`1` xxh128, `2` SHA-1, `3` SHA-256, `4` SHA-384, `5` SHA-512) |
+| 9 | 2 | Hash algorithm version (`1`) |
+| 11 | 1 | Checksum algorithm (`1`: IEEE CRC32) |
+| 12 | 1 | Flags, must be zero |
+| 13 | 1 | Reserved, must be zero |
+| 14 | 2 | Header length (`92`) |
+| 16 | 8 | Error rate, IEEE 754 double |
+| 24 | 8 | Slice count (`k`) |
+| 32 | 8 | Bits per slice |
+| 40 | 8 | Capacity |
+| 48 | 8 | Added-element count |
+| 56 | 8 | Effective bit count |
+| 64 | 4 | Salt payload length |
+| 68 | 8 | Total payload length |
+| 76 | 4 | CRC32 of the zeroed-CRC header followed by the payload |
+| 80 | 12 | Reserved, must be zero |
+
+The payload is the deterministic salt digests followed by
+`ceil(effective_bit_count / 8)` bit bytes. Padding bits above the effective
+bit count must be zero. For salt index `i`, the portable salt is
+`H(H(pack_uint32_le(i)).digest()).digest()`, and a key digest is
+`H(salt || encoded_key)`. Digest integers use little-endian unsigned 16-, 32-,
+or 64-bit words according to the slice width.
+
+**Scalable frame layout:** magic `PBSF`, version `1`, 64-byte little-endian
+header, layer count, growth mode, tightening ratio, initial capacity, outer
+error rate, payload length, CRC32, and a payload of complete portable Bloom
+frames. v1 allows at most 256 layers and a 1 GiB payload; Bloom capacity uses
+an unsigned 32-bit maximum and Bloom payloads also have a 1 GiB limit.
 
 ### Example 4: Understanding Error Rates
 
@@ -240,7 +297,7 @@ BloomFilter(capacity, error_rate=0.001)
 - `union(other)` / `__or__`: Combine with another filter (bitwise OR)
 - `intersection(other)` / `__and__`: Intersect with another filter (bitwise AND)
 - `tofile(f)`: Serialize to file object
-- `fromfile(f, n=-1)`: Deserialize from file (class method)
+- `fromfile(f, n=-1, legacy=False)`: Read one portable v1 object, or one legacy v4 object when explicitly requested
 
 **Properties:**
 - `capacity`: Maximum capacity
@@ -264,7 +321,7 @@ ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWT
 - `__contains__(key)`: Check membership
 - `__len__()`: Return total count across all internal filters
 - `union(other)`: Combine with another scalable filter
-- `tofile(f)` / `fromfile(f)`: Serialization support
+- `tofile(f)` / `fromfile(f, legacy=False)`: Portable v1 serialization and explicit legacy v4 support
 
 **Properties:**
 - `capacity`: Total capacity (sum of all internal filters)
@@ -304,7 +361,7 @@ Version 4.0.0 introduces significant performance improvements but is **not backw
 - **Performance**: Significantly faster hash computation (see [benchmarks](https://github.com/joseph-fox/python-bloomfilter/pull/38))
 - **Incompatibility**: Files saved with versions < 4.0 cannot be loaded with version 4.x
 
-**Migration:** If you have serialized filters from earlier versions, you must regenerate them using version 4.0+.
+**Migration:** Filters from versions earlier than 4.0 cannot be read reliably and should be regenerated. The 4.0 raw layout can be read with `legacy=True`; new files use the checked, self-describing v1 format.
 
 ## Performance
 
