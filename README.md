@@ -196,6 +196,39 @@ print("user_500" in loaded_bf)    # True
 print("user_9999" in loaded_bf)   # False
 ```
 
+### Example: Folding edge-node filters
+
+Partitioned filters from edge nodes can be folded to a smaller slice length when
+the source and target use the same number of slices, hash source, salt layout,
+and key encoding, and the target slice length divides the source length. A
+change in hash integer width is only accepted for the single-slice case.
+
+```python
+large = pybloom_live.BloomFilter(capacity=200, error_rate=0.01)
+small = pybloom_live.BloomFilter(capacity=100, error_rate=0.01)
+
+large.add("edge-a")
+small.add("edge-b")
+
+combined = large | small
+print(combined.bits_per_slice == small.bits_per_slice)
+print(combined.occupancy)
+print(combined.estimated_error_rate)
+```
+
+Folding is lossy and one-way: a small filter cannot be expanded back to the
+large filter. Folded and folded-union filters therefore do not expose the
+original capacity/count guarantee; use the occupancy-based false-positive
+estimate instead.
+
+A direct multi-step fold can also be performed:
+
+```python
+direct = large.fold(small.bits_per_slice)
+chained = large.fold(some_intermediate_bits_per_slice).fold(small.bits_per_slice)
+assert direct.bitarray == chained.bitarray
+```
+
 ### Example 4: Understanding Error Rates
 
 ```python
@@ -237,6 +270,7 @@ BloomFilter(capacity, error_rate=0.001)
 - `__contains__(key)`: Check membership using `in` operator
 - `__len__()`: Return count of elements added
 - `copy()`: Create a copy of the filter
+- `fold(bits_per_slice)`: Return a lossy filter with smaller, evenly dividing slices
 - `union(other)` / `__or__`: Combine with another filter (bitwise OR)
 - `intersection(other)` / `__and__`: Intersect with another filter (bitwise AND)
 - `tofile(f)`: Serialize to file object
@@ -248,6 +282,8 @@ BloomFilter(capacity, error_rate=0.001)
 - `count`: Number of elements added
 - `num_bits`: Total bits in filter
 - `num_slices`: Number of hash functions
+- `occupancy`: Fraction of bits currently set
+- `estimated_error_rate` / `estimated_false_positive_rate`: Occupancy-derived false-positive estimate
 
 ### ScalableBloomFilter
 

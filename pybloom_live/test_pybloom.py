@@ -18,6 +18,7 @@ import random
 import tempfile
 
 import pytest
+import bitarray
 
 from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
 
@@ -477,34 +478,36 @@ class TestBloomFilterSetOperations:
         assert "apple" in bf_union
         assert "banana" in bf_union
 
-    def test_union_requires_matching_capacity(self):
-        """Test that union fails with mismatched capacities.
-
-        Purpose:
-            Validate that union only works on compatible filters.
-
-        Expected:
-            ValueError should be raised for different capacities.
-        """
+    def test_union_folds_compatible_different_capacities(self):
+        """Fold a compatible larger filter before combining it."""
         bf1 = BloomFilter(capacity=100, error_rate=0.01)
         bf2 = BloomFilter(capacity=200, error_rate=0.01)
 
-        with pytest.raises(ValueError, match="same capacity and error rate"):
+        assert bf1.bits_per_slice * 2 == bf2.bits_per_slice
+        bf1.add("small")
+        bf2.add("large")
+
+        result = bf1.union(bf2)
+        assert result.bits_per_slice == bf1.bits_per_slice
+        assert "small" in result
+        assert "large" in result
+
+    def test_union_rejects_non_divisible_capacity(self):
+        """Reject different capacities when slices cannot be folded."""
+        bf1 = BloomFilter(capacity=100, error_rate=0.01)
+        bf2 = BloomFilter(capacity=150, error_rate=0.01)
+
+        assert bf1.bits_per_slice != bf2.bits_per_slice
+
+        with pytest.raises(ValueError, match="must divide"):
             bf1.union(bf2)
 
-    def test_union_requires_matching_error_rate(self):
-        """Test that union fails with mismatched error rates.
-
-        Purpose:
-            Validate that union only works on compatible filters.
-
-        Expected:
-            ValueError should be raised for different error rates.
-        """
+    def test_union_rejects_different_slice_count(self):
+        """Reject filters that use a different number of hash slices."""
         bf1 = BloomFilter(capacity=100, error_rate=0.01)
         bf2 = BloomFilter(capacity=100, error_rate=0.001)
 
-        with pytest.raises(ValueError, match="same capacity and error rate"):
+        with pytest.raises(ValueError, match="same number of hash slices"):
             bf1.union(bf2)
 
     def test_intersection_contains_common_elements(self):
@@ -597,6 +600,164 @@ class TestBloomFilterSetOperations:
 
         with pytest.raises(ValueError, match="equal capacity and error rate"):
             bf1.intersection(bf2)
+
+
+class TestBloomFilterFold:
+    """Tests for lossy, slice-aware Bloom filter folding."""
+
+    def test_make_hashes_mapping_is_fold_compatible(self):
+        """Original modulo positions satisfy h_large % small == h_small."""
+        source_hashes, _ = make_hashfuncs(num_slices=3, num_bits=800)
+        target_hashes, _ = make_hashfuncs(num_slices=3, num_bits=200)
+
+        for key in ('edge-key', b'edge-key', 42):
+            assert all(
+                large % 200 == small
+                for large, small in zip(source_hashes(key), target_hashes(key))
+            )
+
+    def test_fold_preserves_every_inserted_key_in_collision_dense_size(self):
+        source = BloomFilter(capacity=100, error_rate=0.5)
+        keys = [f'collision-{i}' for i in range(40)]
+        for key in keys:
+            source.add(key)
+
+        folded = source.fold(29)
+
+        assert source.bits_per_slice == 145
+        assert folded.bits_per_slice == 29
+        assert folded.occupancy > 0.5
+        assert folded.estimated_error_rate > 0.5
+        assert all(key in folded for key in keys)
+
+    def test_fold_keeps_slice_boundaries_separate(self):
+        """Do not take one modulo over the concatenated bit array."""
+        source_bits = bitarray.bitarray('00001000', endian='little')
+        source = BloomFilter._from_bitarray(2, 4, source_bits)
+
+        folded = source.fold(2)
+
+        assert folded.bitarray == bitarray.bitarray('0010', endian='little')
+
+        naive = bitarray.bitarray('0000', endian='little')
+        for position in source_bits.search(1):
+            naive[position % 2] = True
+        assert folded.bitarray != naive
+
+    def test_one_step_and_two_step_folding_produce_same_bitmap(self):
+        large = BloomFilter(capacity=554, error_rate=0.125)
+        middle = BloomFilter(capacity=277, error_rate=0.125)
+        small = BloomFilter(capacity=138, error_rate=0.125)
+        assert (large.bits_per_slice, middle.bits_per_slice, small.bits_per_slice) \
+            == (800, 400, 200)
+
+        keys = [f'chain-{i}' for i in range(500)]
+        for key in keys:
+            large.add(key)
+
+        direct = large.fold(200)
+        chained = large.fold(400).fold(200)
+
+        assert direct.bitarray == chained.bitarray
+        assert all(key in direct for key in keys)
+        assert all(key in chained for key in keys)
+        assert direct.occupancy > 0.7
+
+    def test_fold_rejects_non_divisible_and_non_smaller_targets(self):
+        source = BloomFilter(capacity=100, error_rate=0.5)
+
+        with pytest.raises(ValueError, match="must divide"):
+            source.fold(30)
+        with pytest.raises(ValueError, match="must be smaller"):
+            source.fold(source.bits_per_slice)
+
+    def test_fold_rejects_integer_width_threshold_change(self):
+        source = BloomFilter._from_bitarray(
+            3, 36000, bitarray.bitarray(3 * 36000, endian='little'))
+
+        with pytest.raises(ValueError, match="threshold"):
+            source.fold(18000)
+
+    def test_fold_allows_single_slice_integer_width_change(self):
+        source = BloomFilter._from_bitarray(
+            1, 65536, bitarray.bitarray(65536, endian='little'))
+
+        folded = source.fold(16384)
+
+        assert folded.bits_per_slice == 16384
+        source_hashes, _ = make_hashfuncs(1, 65536)
+        target_hashes, _ = make_hashfuncs(1, 16384)
+        for key in ('edge', b'edge', 99):
+            assert next(source_hashes(key)) % 16384 == next(target_hashes(key))
+
+    def test_fold_rejects_multi_slice_integer_width_change(self):
+        source = BloomFilter._from_bitarray(
+            3, 65536, bitarray.bitarray(3 * 65536, endian='little'))
+
+        with pytest.raises(ValueError, match="threshold"):
+            source.fold(16384)
+
+    def test_fold_rejects_hash_source_threshold_change(self):
+        source = BloomFilter._from_bitarray(
+            9, 32768, bitarray.bitarray(9 * 32768, endian='little'))
+
+        with pytest.raises(ValueError, match="threshold"):
+            source.fold(16384)
+
+    def test_fold_union_uses_smaller_dimension_and_derived_statistics(self):
+        large = BloomFilter(capacity=200, error_rate=0.01)
+        small = BloomFilter(capacity=100, error_rate=0.01)
+        assert large.bits_per_slice == small.bits_per_slice * 2
+
+        for i in range(20):
+            large.add(f'large-{i}')
+        for i in range(20):
+            small.add(f'small-{i}')
+
+        result = large.union(small)
+        assert result.bits_per_slice == small.bits_per_slice
+        assert all(f'large-{i}' in result for i in range(20))
+        assert all(f'small-{i}' in result for i in range(20))
+        assert result.capacity is None
+        assert result.count is None
+        assert result.error_rate is None
+        assert 0 < result.occupancy < 1
+        assert 0 < result.estimated_error_rate < 1
+        with pytest.raises(TypeError):
+            len(result)
+        with pytest.raises(TypeError):
+            result.add('not a guaranteed filter')
+
+    def test_fold_rejects_different_key_encoding(self):
+        first = BloomFilter(capacity=200, error_rate=0.01)
+        second = BloomFilter(capacity=100, error_rate=0.01)
+        second.key_encoding = 'latin-1'
+
+        with pytest.raises(ValueError, match="same key encoding"):
+            first.union(second)
+
+    def test_folded_filter_serializes_and_restores(self):
+        source = BloomFilter(capacity=100, error_rate=0.5)
+        source.add('persist-me')
+        folded = source.fold(29)
+
+        buffer = io.BytesIO()
+        folded.tofile(buffer)
+        buffer.seek(0)
+        restored = BloomFilter.fromfile(buffer)
+
+        assert restored.bitarray == folded.bitarray
+        assert restored.bits_per_slice == folded.bits_per_slice
+        assert restored.capacity is None
+        assert restored.count is None
+        assert restored.error_rate is None
+        assert restored.occupancy == folded.occupancy
+        assert restored.estimated_error_rate == folded.estimated_error_rate
+        assert 'persist-me' in restored
+
+        pickled = pickle.loads(pickle.dumps(folded))
+        assert pickled.bitarray == folded.bitarray
+        assert pickled.estimated_error_rate == folded.estimated_error_rate
 
 
 # =============================================================================

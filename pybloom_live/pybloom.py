@@ -34,6 +34,53 @@ except ImportError:
     raise ImportError('pybloom_live requires bitarray >= 0.3.4')
 
 
+UNSPECIFIED_METADATA = (1 << 64) - 1
+KEY_ENCODING = 'utf-8'
+
+
+def _hash_parameters(num_slices, num_bits):
+    """Return hash implementation details used by a slice-shaped filter."""
+    if num_bits >= (1 << 31):
+        fmt_code, chunk_size = 'Q', 8
+    elif num_bits >= (1 << 15):
+        fmt_code, chunk_size = 'I', 4
+    else:
+        fmt_code, chunk_size = 'H', 2
+
+    total_hash_bits = 8 * num_slices * chunk_size
+    if total_hash_bits > 384:
+        hashfn = hashlib.sha512
+    elif total_hash_bits > 256:
+        hashfn = hashlib.sha384
+    elif total_hash_bits > 160:
+        hashfn = hashlib.sha256
+    elif total_hash_bits > 128:
+        hashfn = hashlib.sha1
+    else:
+        hashfn = xxhash.xxh128
+
+    digest_chunks = hashfn().digest_size // chunk_size
+    num_salts, extra = divmod(num_slices, digest_chunks)
+    if extra:
+        num_salts += 1
+
+    return hashfn, fmt_code, chunk_size, num_salts
+
+
+def _hash_layout_fold_compatible(source_layout, target_layout, num_slices):
+    """Whether source digest positions reduce directly to target positions."""
+    source_hashfn, source_fmt, source_chunk, source_salts = source_layout
+    target_hashfn, target_fmt, target_chunk, target_salts = target_layout
+
+    if source_hashfn is not target_hashfn:
+        return False
+    if source_fmt == target_fmt:
+        return source_chunk == target_chunk and source_salts == target_salts
+    if num_slices == 1:
+        return source_salts == 1 and target_salts == 1
+    return False
+
+
 def make_hashfuncs(num_slices, num_bits):
     """Create optimized hash functions for the Bloom filter.
 
@@ -68,34 +115,11 @@ def make_hashfuncs(num_slices, num_bits):
         - Single hash computation generates multiple independent values
         - Format codes are optimized for the bit array size
     """
-    # Select format code based on number of bits to optimize struct unpacking
-    if num_bits >= (1 << 31):
-        fmt_code, chunk_size = 'Q', 8  # 64-bit unsigned long long
-    elif num_bits >= (1 << 15):
-        fmt_code, chunk_size = 'I', 4  # 32-bit unsigned int
-    else:
-        fmt_code, chunk_size = 'H', 2  # 16-bit unsigned short
-
-    # Calculate total bits needed and select appropriate hash function
-    total_hash_bits = 8 * num_slices * chunk_size
-    if total_hash_bits > 384:
-        hashfn = hashlib.sha512
-    elif total_hash_bits > 256:
-        hashfn = hashlib.sha384
-    elif total_hash_bits > 160:
-        hashfn = hashlib.sha256
-    elif total_hash_bits > 128:
-        hashfn = hashlib.sha1
-    else:
-        hashfn = xxhash.xxh128  # Fastest option for typical filters
+    hashfn, fmt_code, chunk_size, num_salts = _hash_parameters(
+        num_slices, num_bits)
 
     # Pre-compute format string for unpacking hash digests
     fmt = fmt_code * (hashfn().digest_size // chunk_size)
-
-    # Calculate number of salts needed to generate enough hash values
-    num_salts, extra = divmod(num_slices, len(fmt))
-    if extra:
-        num_salts += 1
 
     # Pre-compute salts for reuse (double-hashing for better distribution)
     salts = tuple(hashfn(hashfn(pack('I', i)).digest()) for i in range(num_salts))
@@ -118,9 +142,9 @@ def make_hashfuncs(num_slices, num_bits):
         """
         # Normalize key to bytes for consistent hashing (Python 3)
         if isinstance(key, str):
-            key = key.encode('utf-8')
+            key = key.encode(KEY_ENCODING)
         elif not isinstance(key, bytes):
-            key = str(key).encode('utf-8')
+            key = str(key).encode(KEY_ENCODING)
 
         # Generate hash values using salted hashing
         i = 0
@@ -222,6 +246,119 @@ class BloomFilter:
         self.num_bits = num_slices * bits_per_slice
         self.count = count
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        _, self.hash_fmt_code, self.hash_chunk_size, self.hash_num_salts = _hash_parameters(
+            self.num_slices, self.bits_per_slice)
+        self.key_encoding = KEY_ENCODING
+
+    @classmethod
+    def _from_bitarray(cls, num_slices, bits_per_slice, data):
+        """Create a folded or combined filter from compatible bit data."""
+        if not isinstance(data, bitarray.bitarray):
+            raise TypeError('data must be a bitarray')
+        expected_bits = num_slices * bits_per_slice
+        if len(data) != expected_bits:
+            raise ValueError('Bit length mismatch!')
+
+        bloom = cls.__new__(cls)
+        bloom._setup(None, num_slices, bits_per_slice, None, None)
+        bloom.bitarray = data[:]
+        return bloom
+
+    @property
+    def occupancy(self):
+        """Fraction of all filter bits that are currently set."""
+        return self.bitarray.count(1) / self.num_bits
+
+    @property
+    def estimated_error_rate(self):
+        """False positive estimate from each slice's observed occupancy."""
+        rate = 1.0
+        for slice_index in range(self.num_slices):
+            start = slice_index * self.bits_per_slice
+            end = start + self.bits_per_slice
+            rate *= self.bitarray[start:end].count(1) / self.bits_per_slice
+        return rate
+
+    @property
+    def estimated_false_positive_rate(self):
+        return self.estimated_error_rate
+
+    @property
+    def false_positive_rate(self):
+        return self.estimated_error_rate
+
+    def _assert_hash_compatible(self, other):
+        if not isinstance(other, BloomFilter):
+            raise TypeError('other must be a BloomFilter')
+        if self.num_slices != other.num_slices:
+            raise ValueError('Folding requires the same number of hash slices')
+        if self.key_encoding != other.key_encoding:
+            raise ValueError('Folding requires the same key encoding')
+        source_layout = (
+            self.hashfn,
+            self.hash_fmt_code,
+            self.hash_chunk_size,
+            self.hash_num_salts,
+        )
+        other_layout = (
+            other.hashfn,
+            other.hash_fmt_code,
+            other.hash_chunk_size,
+            other.hash_num_salts,
+        )
+        if self.hashfn is not other.hashfn:
+            raise ValueError('Folding requires the same underlying hash function')
+        if not _hash_layout_fold_compatible(
+                source_layout, other_layout, self.num_slices):
+            raise ValueError(
+                'Folding is incompatible across this hash integer-width threshold')
+
+    def _assert_fold_compatible(self, target_bits_per_slice):
+        if isinstance(target_bits_per_slice, bool) or \
+                not isinstance(target_bits_per_slice, int) or \
+                target_bits_per_slice <= 0:
+            raise ValueError('Target bits per slice must be a positive integer')
+        if target_bits_per_slice >= self.bits_per_slice:
+            raise ValueError('Target bits per slice must be smaller than the source')
+        if self.bits_per_slice % target_bits_per_slice != 0:
+            raise ValueError('Target bits per slice must divide the source slice length')
+        target_layout = _hash_parameters(
+            self.num_slices, target_bits_per_slice)
+        source_layout = _hash_parameters(
+            self.num_slices, self.bits_per_slice)
+        if not _hash_layout_fold_compatible(
+                source_layout, target_layout, self.num_slices):
+            raise ValueError(
+                'Target crosses an incompatible hash algorithm or integer-width threshold')
+
+    def fold(self, target_bits_per_slice):
+        """Fold every hash slice independently into a smaller slice length.
+
+        Folding is only valid when both filters use the same number of hash
+        slices, hash source, salt layout, and key encoding, and the target
+        slice length divides the source slice length. The modulo relationship
+        then preserves every inserted key. Folding is lossy and cannot be
+        reversed: no method is provided to expand a small filter.
+        """
+        self._assert_fold_compatible(target_bits_per_slice)
+
+        folded = bitarray.bitarray(
+            self.num_slices * target_bits_per_slice, endian='little')
+        folded.setall(False)
+
+        for slice_index in range(self.num_slices):
+            source_start = slice_index * self.bits_per_slice
+            source_end = source_start + self.bits_per_slice
+            target_start = slice_index * target_bits_per_slice
+            source_slice = self.bitarray[source_start:source_end]
+            target_slice = folded[target_start:target_start + target_bits_per_slice]
+            for group_start in range(0, self.bits_per_slice, target_bits_per_slice):
+                target_slice = target_slice | source_slice[
+                    group_start:group_start + target_bits_per_slice]
+            folded[target_start:target_start + target_bits_per_slice] = target_slice
+
+        return self._from_bitarray(
+            self.num_slices, target_bits_per_slice, folded)
 
     def __contains__(self, key):
         """Test whether an element is in the Bloom filter.
@@ -283,6 +420,9 @@ class BloomFilter:
             >>> len(bf)
             2
         """
+        if self.count is None:
+            raise TypeError(
+                'Folded and union-derived filters do not provide an element count')
         return self.count
 
     def add(self, key, skip_check=False):
@@ -325,6 +465,9 @@ class BloomFilter:
             no duplicates. This can improve performance by 30-40%.
         """
         # Check capacity before computing hashes (fail-fast optimization)
+        if self.capacity is None or self.count is None:
+            raise TypeError(
+                'Folded and union-derived filters cannot continue as guaranteed filters')
         if self.count >= self.capacity:
             raise IndexError("BloomFilter is at capacity")
 
@@ -380,27 +523,39 @@ class BloomFilter:
             >>> "banana" in bf2
             True
         """
+        if self.capacity is None:
+            return self._from_bitarray(
+                self.num_slices,
+                self.bits_per_slice,
+                self.bitarray.copy())
+        return self._copy_regular()
+
+    def _copy_regular(self):
         new_filter = BloomFilter(self.capacity, self.error_rate)
         new_filter.bitarray = self.bitarray.copy()
-        new_filter.count = self.count  # Preserve count
+        new_filter.count = self.count
         return new_filter
 
     def union(self, other):
-        """Calculate the union of two Bloom filters.
+        """Combine two hash-compatible partitioned Bloom filters.
 
-        Creates a new Bloom filter containing elements that are in either this
-        filter or the other filter. This is equivalent to the bitwise OR
-        operation on the underlying bit arrays.
+        When the slice lengths differ, the larger filter is folded to the
+        smaller length, then the two bit arrays are OR-combined. The result is
+        a lossy derived filter: its observed occupancy and estimated error
+        rate are available, but it does not retain an original capacity or
+        count guarantee.
 
         Args:
-            other (BloomFilter): Another Bloom filter to union with this one.
-                Must have the same capacity and error rate.
+            other (BloomFilter): A filter with the same number of slices,
+                hash source, salt layout, key encoding, and either equal or
+                evenly dividing slice length.
 
         Returns:
             BloomFilter: A new filter representing the union of both filters
 
         Raises:
-            ValueError: If filters have different capacities or error rates
+            ValueError: If the filters are not hash-compatible or the larger
+                slice length is not divisible by the smaller slice length
 
         Time Complexity:
             O(M) where M is the size of the bit array
@@ -414,17 +569,22 @@ class BloomFilter:
             >>> "apple" in bf_union and "banana" in bf_union
             True
 
-        Note:
-            The count in the resulting filter may not be accurate as it cannot
-            account for elements present in both filters.
+        Folding preserves membership for already inserted keys but is lossy
+        and cannot be reversed.
         """
-        if self.capacity != other.capacity or self.error_rate != other.error_rate:
-            raise ValueError(
-                "Unioning filters requires both filters to have both the same capacity and error rate")
-        new_bloom = self.copy()
-        new_bloom.bitarray = new_bloom.bitarray | other.bitarray
-        # Note: Count is not accurately updated as we can't determine overlaps
-        return new_bloom
+        self._assert_hash_compatible(other)
+
+        if self.bits_per_slice == other.bits_per_slice:
+            combined = self.bitarray | other.bitarray
+            return self._from_bitarray(
+                self.num_slices, self.bits_per_slice, combined)
+
+        larger, smaller = (self, other) if (
+            self.bits_per_slice > other.bits_per_slice) else (other, self)
+        folded_larger = larger.fold(smaller.bits_per_slice)
+        combined = folded_larger.bitarray | smaller.bitarray
+        return self._from_bitarray(
+            smaller.num_slices, smaller.bits_per_slice, combined)
 
     def __or__(self, other):
         """Implement the | operator for union operation.
@@ -513,8 +673,12 @@ class BloomFilter:
             fromfile: Class method to deserialize a filter from a file
         """
         # Write filter parameters as binary header
-        f.write(pack(self.FILE_FMT, self.error_rate, self.num_slices,
-                     self.bits_per_slice, self.capacity, self.count))
+        f.write(pack(self.FILE_FMT,
+                     self.error_rate if self.error_rate is not None else math.nan,
+                     self.num_slices,
+                     self.bits_per_slice,
+                     self.capacity if self.capacity is not None else UNSPECIFIED_METADATA,
+                     self.count if self.count is not None else UNSPECIFIED_METADATA))
         # Write bit array data
         if isinstance(f, BytesIO):
             f.write(self.bitarray.tobytes())
@@ -562,7 +726,16 @@ class BloomFilter:
 
         # Create temporary instance and restore state from file
         filter = cls(1)  # Minimal initialization, will be overwritten
-        filter._setup(*unpack(cls.FILE_FMT, f.read(headerlen)))
+        error_rate, num_slices, bits_per_slice, capacity, count = unpack(
+            cls.FILE_FMT, f.read(headerlen))
+        folded_metadata = math.isnan(error_rate)
+        if folded_metadata:
+            error_rate = None
+        if folded_metadata and capacity == UNSPECIFIED_METADATA:
+            capacity = None
+        if folded_metadata and count == UNSPECIFIED_METADATA:
+            count = None
+        filter._setup(error_rate, num_slices, bits_per_slice, capacity, count)
 
         # Read bit array data
         filter.bitarray = bitarray.bitarray(endian='little')
@@ -581,6 +754,8 @@ class BloomFilter:
         if filter.num_bits != len(filter.bitarray) and \
                 (filter.num_bits + (8 - filter.num_bits % 8) != len(filter.bitarray)):
             raise ValueError('Bit length mismatch!')
+        if len(filter.bitarray) != filter.num_bits:
+            filter.bitarray = filter.bitarray[:filter.num_bits]
 
         return filter
 
@@ -607,8 +782,10 @@ class BloomFilter:
             d (dict): Filter state dictionary from __getstate__
         """
         self.__dict__.update(d)
-        # Reconstruct hash function generator
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        _, self.hash_fmt_code, self.hash_chunk_size, self.hash_num_salts = _hash_parameters(
+            self.num_slices, self.bits_per_slice)
+        self.key_encoding = d.get('key_encoding', KEY_ENCODING)
 
 
 class ScalableBloomFilter:
@@ -834,7 +1011,8 @@ class ScalableBloomFilter:
         # Union corresponding internal filters
         new_filters = []
         for i in range(len(smaller_sbf.filters)):
-            new_filter = larger_sbf.filters[i] | smaller_sbf.filters[i]
+            new_filter = larger_sbf.filters[i].copy()
+            new_filter.bitarray |= smaller_sbf.filters[i].bitarray
             new_filters.append(new_filter)
 
         # Append remaining filters from larger filter
