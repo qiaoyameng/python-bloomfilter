@@ -16,6 +16,7 @@ import io
 import pickle
 import random
 import tempfile
+from struct import pack
 
 import pytest
 
@@ -1137,6 +1138,211 @@ class TestEdgeCases:
         large_string = "x" * 10000
         bf.add(large_string)
         assert large_string in bf
+
+
+class TestPortableSerialization:
+    PORTABLE_BLOOM_FIXTURE = bytes.fromhex(
+        '50424c460165000300000000000000fca9f1d24d62503f'
+        '010000000000000000000000000000001400000000000000'
+        '0a00000002000000010201010201534841313a48415348'
+        '4c49423a31000014000000aa3098f3aae94baac14e3b8b'
+        '8dcae989af93f6a27dfd0b2e733f01e2435b91972f9547'
+        '265ed69b82590119eb084536940711372279375b'
+    )
+
+    def test_fixed_fixture_hash_positions_and_membership(self):
+        string_key = 'héllo'
+        bytes_key = b'\x00\xff'
+        restored = BloomFilter.fromfile(io.BytesIO(self.PORTABLE_BLOOM_FIXTURE))
+
+        assert list(restored.make_hashes(string_key)) == [0, 1, 1, 0, 0, 0, 0, 0, 1, 1]
+        assert list(restored.make_hashes(bytes_key)) == [0, 0, 0, 0, 0, 1, 1, 1, 0, 1]
+        assert string_key in restored
+        assert bytes_key in restored
+        assert 'missing' not in restored
+        assert b'\xff\xff' not in restored
+
+    def test_restored_queries_match_original_for_each_key(self):
+        keys = ['alpha', '世界', b'binary', b'\x00\x01', 42]
+        probes = keys + ['beta', b'binary!', 43]
+        original = BloomFilter(capacity=20, error_rate=0.01)
+        for key in keys:
+            original.add(key)
+
+        buffer = io.BytesIO()
+        original.tofile(buffer)
+        restored = BloomFilter.fromfile(io.BytesIO(buffer.getvalue()))
+
+        for probe in probes:
+            assert (probe in restored) is (probe in original)
+
+    def test_multi_salt_hash_algorithm_round_trip(self):
+        original = BloomFilter(capacity=3, error_rate=1e-15)
+        keys = ['hash-version', b'\x01\x02', '多盐']
+        for key in keys:
+            original.add(key)
+
+        assert original.make_hashes.hash_id == 5
+        assert len(original.make_hashes.salts) > 1
+
+        buffer = io.BytesIO()
+        original.tofile(buffer)
+        restored = BloomFilter.fromfile(io.BytesIO(buffer.getvalue()))
+
+        assert restored.make_hashes.hash_id == 5
+        assert len(restored.make_hashes.salts) == len(original.make_hashes.salts)
+        for key in keys:
+            assert key in restored
+            assert list(restored.make_hashes(key)) == list(original.make_hashes(key))
+
+    def test_concatenated_objects_consume_exactly_one_length(self):
+        first = BloomFilter(capacity=10, error_rate=0.02)
+        second = BloomFilter(capacity=3, error_rate=0.1)
+        first.add('first-key')
+        second.add('second-key')
+
+        stream = io.BytesIO()
+        first.tofile(stream)
+        first_len = stream.tell()
+        second.tofile(stream)
+        second_len = stream.tell() - first_len
+        stream.write(b'trailer')
+        stream.seek(0)
+
+        restored_first = BloomFilter.fromfile(stream)
+        assert stream.tell() == first_len
+        restored_second = BloomFilter.fromfile(stream)
+        assert stream.tell() == first_len + second_len
+        assert stream.read() == b'trailer'
+        assert 'first-key' in restored_first
+        assert 'second-key' in restored_second
+        assert 'second-key' not in restored_first
+
+    def test_n_limit_does_not_read_past_object_boundary(self):
+        first = BloomFilter(capacity=4, error_rate=0.1)
+        second = BloomFilter(capacity=4, error_rate=0.1)
+        first.add('left')
+        second.add('right')
+
+        stream = io.BytesIO()
+        first.tofile(stream)
+        boundary = stream.tell()
+        second.tofile(stream)
+        stream.seek(0)
+
+        restored = BloomFilter.fromfile(stream, boundary)
+        assert stream.tell() == boundary
+        assert 'left' in restored
+        assert 'right' not in restored
+
+    def test_legacy_format_requires_explicit_compatibility(self):
+        original = BloomFilter(capacity=7, error_rate=0.25)
+        original.add('legacy-key')
+        data = pack(
+            BloomFilter.FILE_FMT,
+            original.error_rate,
+            original.num_slices,
+            original.bits_per_slice,
+            original.capacity,
+            original.count,
+        ) + original.bitarray.tobytes()
+
+        with pytest.raises(ValueError, match='Unrecognized'):
+            BloomFilter.fromfile(io.BytesIO(data))
+
+        stream = io.BytesIO(data + b'next-object')
+        restored = BloomFilter.fromfile(stream, legacy=True)
+        assert 'legacy-key' in restored
+        assert stream.read() == b'next-object'
+
+    def test_truncation_is_rejected(self):
+        data = self.PORTABLE_BLOOM_FIXTURE
+        for size in (0, 3, len(data) - 1):
+            with pytest.raises(ValueError, match='Truncated'):
+                BloomFilter.fromfile(io.BytesIO(data[:size]))
+
+    def test_nonzero_padding_bits_are_rejected(self):
+        data = bytearray(self.PORTABLE_BLOOM_FIXTURE)
+        payload_end = len(data) - 32
+        data[payload_end - 1] |= 0x20
+
+        with pytest.raises(ValueError, match='padding'):
+            BloomFilter.fromfile(io.BytesIO(data))
+
+    def test_parameter_mismatch_is_rejected(self):
+        data = bytearray(self.PORTABLE_BLOOM_FIXTURE)
+        capacity_offset = 29
+        data[capacity_offset] ^= 0x01
+
+        with pytest.raises(ValueError):
+            BloomFilter.fromfile(io.BytesIO(data))
+
+    def test_checksum_failure_is_rejected(self):
+        data = bytearray(self.PORTABLE_BLOOM_FIXTURE)
+        data[-1] ^= 0x01
+
+        with pytest.raises(ValueError, match='checksum'):
+            BloomFilter.fromfile(io.BytesIO(data))
+
+    def test_scalable_portable_round_trip_and_boundary(self):
+        original = ScalableBloomFilter(initial_capacity=5)
+        keys = [f'scalable-{index}' for index in range(18)]
+        for key in keys:
+            original.add(key)
+
+        stream = io.BytesIO()
+        original.tofile(stream)
+        object_len = stream.tell()
+        stream.write(b'next-layer-object')
+        stream.seek(0)
+
+        restored = ScalableBloomFilter.fromfile(stream)
+        assert stream.tell() == object_len
+        assert stream.read() == b'next-layer-object'
+        assert len(restored.filters) == len(original.filters)
+        for key in keys:
+            assert key in restored
+
+    def test_legacy_scalable_format_requires_explicit_compatibility(self):
+        original = ScalableBloomFilter(initial_capacity=5)
+        keys = [f'legacy-scalable-{index}' for index in range(12)]
+        for key in keys:
+            original.add(key)
+
+        stream = io.BytesIO()
+        stream.write(pack(
+            ScalableBloomFilter.FILE_FMT,
+            original.scale,
+            original.ratio,
+            original.initial_capacity,
+            original.error_rate,
+        ))
+        stream.write(pack('<l', len(original.filters)))
+        encoded_filters = []
+        for inner in original.filters:
+            encoded = pack(
+                BloomFilter.FILE_FMT,
+                inner.error_rate,
+                inner.num_slices,
+                inner.bits_per_slice,
+                inner.capacity,
+                inner.count,
+            ) + inner.bitarray.tobytes()
+            encoded_filters.append(encoded)
+        stream.write(pack('<' + 'Q' * len(encoded_filters),
+                          *[len(encoded) for encoded in encoded_filters]))
+        for encoded in encoded_filters:
+            stream.write(encoded)
+        stream.write(b'after-scalable')
+
+        data = stream.getvalue()
+        with pytest.raises(ValueError, match='Unrecognized'):
+            ScalableBloomFilter.fromfile(io.BytesIO(data))
+
+        legacy_stream = io.BytesIO(data)
+        restored = ScalableBloomFilter.fromfile(legacy_stream, legacy=True)
+        assert all(key in restored for key in keys)
+        assert legacy_stream.read() == b'after-scalable'
 
 
 if __name__ == '__main__':

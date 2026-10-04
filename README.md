@@ -187,13 +187,30 @@ for i in range(1000):
 with open('bloom_filter.bin', 'wb') as f:
     bf.tofile(f)
 
-# Load from file
+# Load from file (new files use the portable format by default)
 with open('bloom_filter.bin', 'rb') as f:
     loaded_bf = pybloom_live.BloomFilter.fromfile(f)
 
 # Verify
 print("user_500" in loaded_bf)    # True
 print("user_9999" in loaded_bf)   # False
+```
+
+Files written by `BloomFilter.tofile()` are self-delimited, so multiple
+filters may be concatenated in one stream. Each call to `fromfile()` consumes
+only the current object and leaves the stream positioned before the next one:
+
+```python
+first = pybloom_live.BloomFilter.fromfile(stream)
+second = pybloom_live.BloomFilter.fromfile(stream)
+```
+
+Old header-only files from previous releases are never inferred as a valid
+version. They are read only when compatibility is explicitly requested:
+
+```python
+bf = pybloom_live.BloomFilter.fromfile(stream, legacy=True)
+sbf = pybloom_live.ScalableBloomFilter.fromfile(stream, legacy=True)
 ```
 
 ### Example 4: Understanding Error Rates
@@ -240,7 +257,7 @@ BloomFilter(capacity, error_rate=0.001)
 - `union(other)` / `__or__`: Combine with another filter (bitwise OR)
 - `intersection(other)` / `__and__`: Intersect with another filter (bitwise AND)
 - `tofile(f)`: Serialize to file object
-- `fromfile(f, n=-1)`: Deserialize from file (class method)
+- `fromfile(f, n=-1, legacy=False)`: Read one portable object, or one legacy object in compatibility mode
 
 **Properties:**
 - `capacity`: Maximum capacity
@@ -264,7 +281,7 @@ ScalableBloomFilter(initial_capacity=100, error_rate=0.001, mode=LARGE_SET_GROWT
 - `__contains__(key)`: Check membership
 - `__len__()`: Return total count across all internal filters
 - `union(other)`: Combine with another scalable filter
-- `tofile(f)` / `fromfile(f)`: Serialization support
+- `tofile(f)` / `fromfile(f, legacy=False)`: Versioned serialization support
 
 **Properties:**
 - `capacity`: Total capacity (sum of all internal filters)
@@ -285,6 +302,35 @@ The library automatically selects the optimal hash function based on the number 
 | > 384 | SHA-512 | Cryptographic |
 
 ## Algorithm Details
+
+### Portable File Format v1
+
+The portable Bloom object begins with ASCII magic `PBLF`, format version
+`1`, and all fixed-width integers encoded little-endian. The fixed header
+records error rate, capacity, count, slice count, slice width, total bit
+count, key encoding, hash algorithm and version, unsigned integer encoding,
+bit order, integer width, salt construction, salt length, payload length, and
+the variable-length salt data.
+
+- Keys that are `str` are encoded as UTF-8; `bytes`, `bytearray`, and
+  `memoryview` are hashed as their bytes.
+- Digest integers are unsigned little-endian values (`H`, `I`, or `Q`) chosen
+  from the slice width.
+- Salt `i` is `H(H(pack("<I", i)).digest()).digest()`, where `H` is the
+  selected hash function.
+- Payload bits are LSB-first in each byte. Padding bits in the final byte
+  must be zero.
+- The object ends with a 32-byte SHA-256 checksum over the complete header
+  and bit payload.
+
+Hash algorithm identifiers are: `1` for XXH3-128 (`XXH3_128:<xxHash
+version>`), `2` for SHA-1, `3` for SHA-256, `4` for SHA-384, and `5` for
+SHA-512. The SHA identifiers use version tag `HASHLIB:1`.
+
+Portable scalable objects begin with `PSBF`, version `1`, contain a checked
+outer header and a payload of concatenated portable Bloom objects. Readers
+validate layer count, payload length, growth parameters, per-layer capacity,
+and per-layer error rate.
 
 This implementation follows the Scalable Bloom Filter algorithm from:
 

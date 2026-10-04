@@ -23,8 +23,7 @@ Requirements:
 import copy
 import hashlib
 import math
-from io import BytesIO
-from struct import calcsize, pack, unpack
+from struct import Struct, calcsize, pack, unpack
 
 import xxhash
 
@@ -32,6 +31,101 @@ try:
     import bitarray
 except ImportError:
     raise ImportError('pybloom_live requires bitarray >= 0.3.4')
+
+
+PORTABLE_MAGIC = b'PBLF'
+PORTABLE_VERSION = 1
+SCALABLE_PORTABLE_MAGIC = b'PSBF'
+SCALABLE_PORTABLE_VERSION = 1
+
+MAX_BLOOM_CAPACITY = 1 << 40
+MAX_BLOOM_PAYLOAD_BYTES = 1 << 30
+MAX_NUM_SLICES = 4096
+MAX_SCALABLE_FILTERS = 1024
+MAX_SCALABLE_PAYLOAD_BYTES = 1 << 40
+
+KEY_ENCODING_UTF8_OR_BYTES = 1
+UINT_ENCODING_LITTLE_ENDIAN = 1
+BIT_ORDER_LSB_FIRST = 1
+SALT_SCHEME_U32LE_DOUBLE_DIGEST = 1
+
+HASH_ALGORITHM_XXH3_128 = 1
+HASH_ALGORITHM_SHA1 = 2
+HASH_ALGORITHM_SHA256 = 3
+HASH_ALGORITHM_SHA384 = 4
+HASH_ALGORITHM_SHA512 = 5
+
+_HASH_ALGORITHMS = {
+    HASH_ALGORITHM_XXH3_128: xxhash.xxh128,
+    HASH_ALGORITHM_SHA1: hashlib.sha1,
+    HASH_ALGORITHM_SHA256: hashlib.sha256,
+    HASH_ALGORITHM_SHA384: hashlib.sha384,
+    HASH_ALGORITHM_SHA512: hashlib.sha512,
+}
+
+_HASH_VERSIONS = {
+    HASH_ALGORITHM_XXH3_128: b'XXH3_128:' + xxhash.XXHASH_VERSION.encode('ascii'),
+    HASH_ALGORITHM_SHA1: b'SHA1:HASHLIB:1',
+    HASH_ALGORITHM_SHA256: b'SHA256:HASHLIB:1',
+    HASH_ALGORITHM_SHA384: b'SHA384:HASHLIB:1',
+    HASH_ALGORITHM_SHA512: b'SHA512:HASHLIB:1',
+}
+
+_PORTABLE_HEADER = Struct(
+    '<4sBHQdQQQIIBBBBBB16sI'
+)
+_SCALABLE_PORTABLE_HEADER = Struct('<4sBHQidQdI')
+
+
+def _read_exact(f, size):
+    """Read exactly size bytes, rejecting truncated streams."""
+    chunks = []
+    remaining = size
+    while remaining:
+        chunk = f.read(remaining)
+        if not chunk:
+            raise ValueError('Truncated Bloom filter data')
+        if not isinstance(chunk, bytes):
+            raise ValueError('Binary streams must return bytes')
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b''.join(chunks)
+
+
+class _BoundedReader:
+    def __init__(self, stream, limit):
+        self._stream = stream
+        self._remaining = limit
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            size = self._remaining
+        size = min(size, self._remaining)
+        if size == 0:
+            return b''
+        chunk = self._stream.read(size)
+        if not chunk:
+            return b''
+        if len(chunk) > self._remaining:
+            raise ValueError('Read exceeded Bloom filter object boundary')
+        self._remaining -= len(chunk)
+        return chunk
+
+
+class _HashingReader:
+    def __init__(self, stream, hasher):
+        self._stream = stream
+        self._hasher = hasher
+
+    def read(self, size=-1):
+        chunk = self._stream.read(size)
+        if chunk:
+            self._hasher.update(chunk)
+        return chunk
+
+    @property
+    def remaining(self):
+        return self._stream._remaining
 
 
 def make_hashfuncs(num_slices, num_bits):
@@ -79,26 +173,35 @@ def make_hashfuncs(num_slices, num_bits):
     # Calculate total bits needed and select appropriate hash function
     total_hash_bits = 8 * num_slices * chunk_size
     if total_hash_bits > 384:
+        hash_id = HASH_ALGORITHM_SHA512
         hashfn = hashlib.sha512
     elif total_hash_bits > 256:
+        hash_id = HASH_ALGORITHM_SHA384
         hashfn = hashlib.sha384
     elif total_hash_bits > 160:
+        hash_id = HASH_ALGORITHM_SHA256
         hashfn = hashlib.sha256
     elif total_hash_bits > 128:
+        hash_id = HASH_ALGORITHM_SHA1
         hashfn = hashlib.sha1
     else:
+        hash_id = HASH_ALGORITHM_XXH3_128
         hashfn = xxhash.xxh128  # Fastest option for typical filters
 
     # Pre-compute format string for unpacking hash digests
-    fmt = fmt_code * (hashfn().digest_size // chunk_size)
+    uint_count = hashfn().digest_size // chunk_size
+    fmt = '<' + fmt_code * uint_count
 
     # Calculate number of salts needed to generate enough hash values
-    num_salts, extra = divmod(num_slices, len(fmt))
+    num_salts, extra = divmod(num_slices, uint_count)
     if extra:
         num_salts += 1
 
     # Pre-compute salts for reuse (double-hashing for better distribution)
-    salts = tuple(hashfn(hashfn(pack('I', i)).digest()) for i in range(num_salts))
+    salts = tuple(
+        hashfn(hashfn(pack('<I', i)).digest()).digest()
+        for i in range(num_salts)
+    )
 
     def _hash_maker(key):
         """Generate hash values for a given key.
@@ -119,13 +222,15 @@ def make_hashfuncs(num_slices, num_bits):
         # Normalize key to bytes for consistent hashing (Python 3)
         if isinstance(key, str):
             key = key.encode('utf-8')
+        elif isinstance(key, (bytes, bytearray, memoryview)):
+            key = bytes(key)
         elif not isinstance(key, bytes):
             key = str(key).encode('utf-8')
 
         # Generate hash values using salted hashing
         i = 0
         for salt in salts:
-            h = salt.copy()  # Copy pre-computed salt (fast operation)
+            h = hashfn(salt)
             h.update(key)    # Hash the key
             # Unpack hash digest into multiple integers
             for uint in unpack(fmt, h.digest()):
@@ -134,6 +239,15 @@ def make_hashfuncs(num_slices, num_bits):
                 if i >= num_slices:  # Early exit optimization
                     return
 
+    _hash_maker.hash_id = hash_id
+    _hash_maker.hashfn = hashfn
+    _hash_maker.chunk_size = chunk_size
+    _hash_maker.uint_count = uint_count
+    _hash_maker.salts = salts
+    _hash_maker.key_encoding = KEY_ENCODING_UTF8_OR_BYTES
+    _hash_maker.uint_encoding = UINT_ENCODING_LITTLE_ENDIAN
+    _hash_maker.bit_order = BIT_ORDER_LSB_FIRST
+    _hash_maker.salt_scheme = SALT_SCHEME_U32LE_DOUBLE_DIGEST
     return _hash_maker, hashfn
 
 
@@ -185,6 +299,8 @@ class BloomFilter:
             raise ValueError("Error_Rate must be between 0 and 1.")
         if not capacity > 0:
             raise ValueError("Capacity must be > 0")
+        if capacity > MAX_BLOOM_CAPACITY:
+            raise ValueError("Capacity exceeds portable format limit")
 
         # Calculate optimal number of hash functions (k)
         # k = ceil(log2(1/P)) minimizes false positive rate
@@ -197,11 +313,15 @@ class BloomFilter:
             (capacity * abs(math.log(error_rate))) /
             (num_slices * (math.log(2) ** 2))))
 
+        num_bits = num_slices * bits_per_slice
+        self._validate_parameters(
+            error_rate, num_slices, bits_per_slice, num_bits, capacity, 0)
         self._setup(error_rate, num_slices, bits_per_slice, capacity, 0)
         self.bitarray = bitarray.bitarray(self.num_bits, endian='little')
         self.bitarray.setall(False)
 
-    def _setup(self, error_rate, num_slices, bits_per_slice, capacity, count):
+    def _setup(self, error_rate, num_slices, bits_per_slice, capacity, count,
+               hash_spec=None):
         """Internal setup method for initializing or restoring filter state.
 
         This method is used both during normal initialization and when
@@ -221,7 +341,53 @@ class BloomFilter:
         self.capacity = capacity
         self.num_bits = num_slices * bits_per_slice
         self.count = count
-        self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        self._validate_parameters(
+            error_rate, num_slices, bits_per_slice, self.num_bits,
+            capacity, count)
+        expected_hashes, self.hashfn = make_hashfuncs(
+            self.num_slices, self.bits_per_slice)
+        if hash_spec is None:
+            self.make_hashes = expected_hashes
+            return
+
+        self.make_hashes = self._validate_hash_spec(
+            expected_hashes, hash_spec, self.num_slices)
+
+    @staticmethod
+    def _validate_hash_spec(expected_hashes, hash_spec, num_slices):
+        required_keys = {
+            'hash_id', 'hash_version', 'chunk_size', 'uint_count',
+            'salt_scheme', 'key_encoding', 'uint_encoding', 'bit_order',
+            'salts'
+        }
+        if set(hash_spec) != required_keys:
+            raise ValueError('Hash specification fields mismatch')
+        if hash_spec['hash_id'] != expected_hashes.hash_id:
+            raise ValueError('Hash algorithm mismatch')
+        if hash_spec['hash_version'] != _HASH_VERSIONS[expected_hashes.hash_id]:
+            raise ValueError('Hash algorithm version mismatch')
+        if hash_spec['chunk_size'] != expected_hashes.chunk_size:
+            raise ValueError('Hash integer width mismatch')
+        if hash_spec['uint_count'] != expected_hashes.uint_count:
+            raise ValueError('Hash integer count mismatch')
+        if hash_spec['salt_scheme'] != expected_hashes.salt_scheme:
+            raise ValueError('Salt construction mismatch')
+        if hash_spec['key_encoding'] != expected_hashes.key_encoding:
+            raise ValueError('Key encoding mismatch')
+        if hash_spec['uint_encoding'] != expected_hashes.uint_encoding:
+            raise ValueError('Integer byte order mismatch')
+        if hash_spec['bit_order'] != expected_hashes.bit_order:
+            raise ValueError('Bit order mismatch')
+
+        salts = hash_spec['salts']
+        if not isinstance(salts, tuple) or salts != expected_hashes.salts:
+            raise ValueError('Salt values mismatch')
+        required_salts = (
+            (num_slices + expected_hashes.uint_count - 1) //
+            expected_hashes.uint_count)
+        if len(salts) != required_salts:
+            raise ValueError('Salt count mismatch')
+        return expected_hashes
 
     def __contains__(self, key):
         """Test whether an element is in the Bloom filter.
@@ -488,101 +654,180 @@ class BloomFilter:
         return self.intersection(other)
 
     def tofile(self, f):
-        """Serialize the Bloom filter to a file.
+        """Serialize to the current portable, versioned Bloom format."""
+        header, payload, checksum = self._portable_parts()
+        f.write(header)
+        f.write(payload)
+        f.write(checksum)
 
-        Writes the filter to a binary file format that is much more space
-        efficient than Python's pickle format. The file contains the filter
-        parameters followed by the raw bit array data.
+    def _portable_parts(self):
+        hashes = self.make_hashes
+        hash_version = _HASH_VERSIONS[hashes.hash_id]
+        if len(hash_version) > 16:
+            raise ValueError('Hash version identifier is too long')
+        salts = b''.join(hashes.salts)
+        payload = self.bitarray.tobytes()
+        self._validate_state(len(payload))
+        header_len = _PORTABLE_HEADER.size + len(salts)
 
-        File Format:
-            - Header (40 bytes): error_rate, num_slices, bits_per_slice,
-              capacity, count (packed as '<dQQQQ')
-            - Body: Raw bit array data
+        fixed = _PORTABLE_HEADER.pack(
+            PORTABLE_MAGIC, PORTABLE_VERSION, header_len, len(payload),
+            self.error_rate, self.capacity, self.count, self.num_bits,
+            self.num_slices, self.bits_per_slice,
+            hashes.key_encoding, hashes.hash_id, hashes.uint_encoding,
+            hashes.bit_order, hashes.chunk_size, hashes.salt_scheme,
+            hash_version.ljust(16, b'\x00'), len(salts))
+        header = fixed + salts
+        checksum = hashlib.sha256(header + payload).digest()
+        return header, payload, checksum
 
-        Args:
-            f: File-like object opened in binary write mode ('wb'). Can be a
-                regular file or BytesIO.
+    @staticmethod
+    def _validate_parameters(error_rate, num_slices, bits_per_slice,
+                             num_bits, capacity, count):
+        if not math.isfinite(error_rate) or not 0 < error_rate < 1:
+            raise ValueError('Invalid error rate')
+        if not 0 < num_slices <= MAX_NUM_SLICES:
+            raise ValueError('Unsupported number of slices')
+        if bits_per_slice <= 0:
+            raise ValueError('Invalid slice width')
+        if num_slices * bits_per_slice != num_bits or num_bits <= 0:
+            raise ValueError('Bit length mismatch')
+        if (num_bits + 7) // 8 > MAX_BLOOM_PAYLOAD_BYTES:
+            raise ValueError('Payload length exceeds limit')
+        if not 0 < capacity <= MAX_BLOOM_CAPACITY:
+            raise ValueError('Unsupported capacity')
+        if not 0 <= count <= capacity:
+            raise ValueError('Invalid stored count')
 
-        Example:
-            >>> bf = BloomFilter(1000, 0.01)
-            >>> bf.add("test")
-            >>> with open('filter.bin', 'wb') as f:
-            ...     bf.tofile(f)
-
-        See Also:
-            fromfile: Class method to deserialize a filter from a file
-        """
-        # Write filter parameters as binary header
-        f.write(pack(self.FILE_FMT, self.error_rate, self.num_slices,
-                     self.bits_per_slice, self.capacity, self.count))
-        # Write bit array data
-        if isinstance(f, BytesIO):
-            f.write(self.bitarray.tobytes())
-        else:
-            self.bitarray.tofile(f)
+    def _validate_state(self, payload_len):
+        self._validate_parameters(
+            self.error_rate, self.num_slices, self.bits_per_slice,
+            self.num_bits, self.capacity, self.count)
+        expected_payload_len = (self.num_bits + 7) // 8
+        if payload_len != expected_payload_len:
+            raise ValueError('Bit length mismatch')
+        if payload_len > MAX_BLOOM_PAYLOAD_BYTES:
+            raise ValueError('Payload length exceeds limit')
 
     @classmethod
-    def fromfile(cls, f, n=-1):
-        """Deserialize a Bloom filter from a file.
-
-        Reads a Bloom filter that was previously saved using the tofile()
-        method. The file must contain a valid filter in the binary format
-        written by tofile().
-
-        Args:
-            f: File-like object opened in binary read mode ('rb'). Can be a
-                regular file or BytesIO.
-            n (int, optional): Maximum number of bytes to read. If n > 0,
-                reads at most n bytes. If n <= 0 (default), reads the entire
-                filter. Must be at least as large as the header (40 bytes).
-
-        Returns:
-            BloomFilter: A new BloomFilter instance with the state loaded
-                from the file
-
-        Raises:
-            ValueError: If n is too small (< header size)
-            ValueError: If the bit array length doesn't match the expected size
-
-        Example:
-            >>> with open('filter.bin', 'rb') as f:
-            ...     bf = BloomFilter.fromfile(f)
-            >>> "test" in bf
-            True
-
-        Note:
-            Filters saved with version < 4.0.0 are incompatible due to hash
-            function changes (MD5 → xxHash).
-        """
-        headerlen = calcsize(cls.FILE_FMT)
-
-        # Validate minimum read size
-        if 0 < n < headerlen:
+    def fromfile(cls, f, n=-1, legacy=False):
+        """Read one self-delimited Bloom object from a binary stream."""
+        if n == 0 or 0 < n < 4:
             raise ValueError('n too small!')
+        stream = _BoundedReader(f, n) if n > 0 else f
+        magic = _read_exact(stream, 4)
+        if magic == PORTABLE_MAGIC:
+            return cls._from_portable(stream, magic)
+        if legacy:
+            return cls._from_legacy(stream, magic, n)
+        raise ValueError('Unrecognized Bloom filter format; enable legacy reading explicitly')
 
-        # Create temporary instance and restore state from file
-        filter = cls(1)  # Minimal initialization, will be overwritten
-        filter._setup(*unpack(cls.FILE_FMT, f.read(headerlen)))
+    @classmethod
+    def _from_portable(cls, f, magic):
+        fixed = magic + _read_exact(f, _PORTABLE_HEADER.size - 4)
+        values = _PORTABLE_HEADER.unpack(fixed)
+        (_magic, version, header_len, payload_len, error_rate, capacity,
+         count, num_bits, num_slices, bits_per_slice, key_encoding, hash_id,
+         uint_encoding, bit_order, chunk_size, salt_scheme, hash_version,
+         salt_len) = values
 
-        # Read bit array data
-        filter.bitarray = bitarray.bitarray(endian='little')
-        if isinstance(f, BytesIO):
-            if n > 0:
-                filter.bitarray.frombytes(f.read(n - headerlen))
-            else:
-                filter.bitarray.frombytes(f.read())
+        if version != PORTABLE_VERSION:
+            raise ValueError('Unsupported portable Bloom filter version')
+        if header_len < _PORTABLE_HEADER.size:
+            raise ValueError('Invalid portable header length')
+        if header_len - _PORTABLE_HEADER.size != salt_len:
+            raise ValueError('Salt length mismatch')
+        if payload_len > MAX_BLOOM_PAYLOAD_BYTES:
+            raise ValueError('Payload length exceeds limit')
+
+        cls._validate_parameters(
+            error_rate, num_slices, bits_per_slice, num_bits, capacity, count)
+        if payload_len != (num_bits + 7) // 8:
+            raise ValueError('Bit length mismatch')
+        if key_encoding != KEY_ENCODING_UTF8_OR_BYTES:
+            raise ValueError('Unsupported key encoding')
+        if uint_encoding != UINT_ENCODING_LITTLE_ENDIAN:
+            raise ValueError('Unsupported integer byte order')
+        if bit_order != BIT_ORDER_LSB_FIRST:
+            raise ValueError('Unsupported bit order')
+        if salt_scheme != SALT_SCHEME_U32LE_DOUBLE_DIGEST:
+            raise ValueError('Unsupported salt construction')
+        if hash_id not in _HASH_ALGORITHMS:
+            raise ValueError('Unsupported hash algorithm')
+
+        if chunk_size not in (2, 4, 8):
+            raise ValueError('Unsupported integer width')
+        if bits_per_slice >= (1 << 31):
+            expected_chunk_size = 8
+        elif bits_per_slice >= (1 << 15):
+            expected_chunk_size = 4
         else:
-            if n > 0:
-                filter.bitarray.fromfile(f, n - headerlen)
-            else:
-                filter.bitarray.fromfile(f)
+            expected_chunk_size = 2
+        if chunk_size != expected_chunk_size:
+            raise ValueError('Hash integer width mismatch')
 
-        # Validate bit array length (accounting for byte padding)
-        if filter.num_bits != len(filter.bitarray) and \
-                (filter.num_bits + (8 - filter.num_bits % 8) != len(filter.bitarray)):
-            raise ValueError('Bit length mismatch!')
+        expected_hashfn = _HASH_ALGORITHMS[hash_id]
+        digest_size = expected_hashfn().digest_size
+        expected_version = _HASH_VERSIONS[hash_id]
+        if hash_version != expected_version.ljust(16, b'\x00'):
+            raise ValueError('Hash algorithm or version mismatch')
+        if hash_version[len(expected_version):] != b'\x00' * (16 - len(expected_version)):
+            raise ValueError('Invalid hash version padding')
 
-        return filter
+        salt_bytes = _read_exact(f, salt_len)
+        expected_salt_count = (
+            (num_slices + digest_size // chunk_size - 1) //
+            (digest_size // chunk_size))
+        if salt_len != expected_salt_count * digest_size:
+            raise ValueError('Invalid salt data length')
+        salts = tuple(
+            salt_bytes[start:start + digest_size]
+            for start in range(0, salt_len, digest_size))
+
+        payload = _read_exact(f, payload_len)
+        padding = num_bits % 8
+        if padding and payload[-1] & (0xFF << padding):
+            raise ValueError('Non-zero padding bits')
+
+        restored = cls.__new__(cls)
+        hash_spec = {
+            'hash_id': hash_id,
+            'hash_version': expected_version,
+            'chunk_size': chunk_size,
+            'uint_count': digest_size // chunk_size,
+            'salt_scheme': salt_scheme,
+            'key_encoding': key_encoding,
+            'uint_encoding': uint_encoding,
+            'bit_order': bit_order,
+            'salts': salts,
+        }
+        restored._setup(error_rate, num_slices, bits_per_slice, capacity,
+                        count, hash_spec)
+        restored.bitarray = bitarray.bitarray(endian='little')
+        restored.bitarray.frombytes(payload)
+        del restored.bitarray[num_bits:]
+
+        checksum = _read_exact(f, hashlib.sha256().digest_size)
+        if checksum != hashlib.sha256(fixed + salt_bytes + payload).digest():
+            raise ValueError('Bloom filter checksum mismatch')
+        return restored
+
+    @classmethod
+    def _from_legacy(cls, f, magic, n):
+        headerlen = calcsize(cls.FILE_FMT)
+        header = magic + _read_exact(f, headerlen - 4)
+        error_rate, num_slices, bits_per_slice, capacity, count = unpack(
+            cls.FILE_FMT, header)
+        restored = cls.__new__(cls)
+        restored._setup(error_rate, num_slices, bits_per_slice, capacity, count)
+        payload_len = (restored.num_bits + 7) // 8
+        if n > 0 and n - headerlen < payload_len:
+            raise ValueError('Truncated Bloom filter data')
+        payload = _read_exact(f, payload_len)
+        restored.bitarray = bitarray.bitarray(endian='little')
+        restored.bitarray.frombytes(payload)
+        del restored.bitarray[restored.num_bits:]
+        return restored
 
     def __getstate__(self):
         """Prepare the filter state for pickling.
@@ -888,100 +1133,123 @@ class ScalableBloomFilter:
         return len(self)
 
     def tofile(self, f):
-        """Serialize this Scalable Bloom Filter to a file.
+        """Serialize to the current portable scalable Bloom format."""
+        self._validate_container()
+        payload_parts = []
+        for inner in self.filters:
+            header, payload, checksum = inner._portable_parts()
+            payload_parts.append(header + payload + checksum)
+        payload = b''.join(payload_parts)
+        if len(payload) > MAX_SCALABLE_PAYLOAD_BYTES:
+            raise ValueError('Payload length exceeds limit')
 
-        Writes the filter and all internal BloomFilter instances to a binary
-        file format. The format includes metadata about each internal filter
-        for efficient deserialization.
+        header = _SCALABLE_PORTABLE_HEADER.pack(
+            SCALABLE_PORTABLE_MAGIC, SCALABLE_PORTABLE_VERSION,
+            _SCALABLE_PORTABLE_HEADER.size, len(payload), self.scale,
+            self.ratio, self.initial_capacity, self.error_rate,
+            len(self.filters))
+        f.write(header)
+        f.write(payload)
+        f.write(hashlib.sha256(header + payload).digest())
 
-        File Format:
-            1. Header: scale, ratio, initial_capacity, error_rate (32 bytes)
-            2. Number of internal filters (4 bytes)
-            3. Size table: size of each internal filter in bytes
-            4. Internal filter data: each filter serialized sequentially
-
-        Args:
-            f: File-like object opened in binary write mode ('wb')
-
-        Example:
-            >>> sbf = ScalableBloomFilter()
-            >>> for i in range(1000):
-            ...     sbf.add(i)
-            >>> with open('scalable_filter.bin', 'wb') as f:
-            ...     sbf.tofile(f)
-
-        See Also:
-            fromfile: Class method to deserialize a filter from a file
-        """
-        # Write main filter parameters
-        f.write(pack(self.FILE_FMT, self.scale, self.ratio,
-                     self.initial_capacity, self.error_rate))
-
-        # Write number of internal filters
-        f.write(pack(b'<l', len(self.filters)))
-
-        if len(self.filters) > 0:
-            # Write size table for internal filters, then filter data
-            headerpos = f.tell()
-            headerfmt = b'<' + b'Q' * (len(self.filters))
-            # Reserve space for size table
-            f.write(b'.' * calcsize(headerfmt))
-
-            # Write each internal filter and record its size
-            filter_sizes = []
-            for filter in self.filters:
-                begin = f.tell()
-                filter.tofile(f)
-                filter_sizes.append(f.tell() - begin)
-
-            # Go back and write size table
-            f.seek(headerpos)
-            f.write(pack(headerfmt, *filter_sizes))
+    def _validate_container(self):
+        if self.scale not in (self.SMALL_SET_GROWTH, self.LARGE_SET_GROWTH):
+            raise ValueError('Invalid growth mode')
+        if not math.isfinite(self.ratio) or self.ratio <= 0 or self.ratio >= 1:
+            raise ValueError('Invalid tightening ratio')
+        if not 0 < self.initial_capacity <= MAX_BLOOM_CAPACITY:
+            raise ValueError('Unsupported initial capacity')
+        if not math.isfinite(self.error_rate) or not 0 < self.error_rate < 1:
+            raise ValueError('Invalid error rate')
+        if not 0 <= len(self.filters) <= MAX_SCALABLE_FILTERS:
+            raise ValueError('Unsupported number of filters')
 
     @classmethod
-    def fromfile(cls, f):
-        """Deserialize a Scalable Bloom Filter from a file.
+    def fromfile(cls, f, legacy=False):
+        """Read one self-delimited scalable Bloom object."""
+        magic = _read_exact(f, 4)
+        if magic == SCALABLE_PORTABLE_MAGIC:
+            return cls._from_portable(f, magic)
+        if legacy:
+            return cls._from_legacy(f, magic)
+        raise ValueError(
+            'Unrecognized scalable Bloom filter format; enable legacy reading explicitly')
 
-        Reads a Scalable Bloom Filter that was previously saved using the
-        tofile() method, including all internal BloomFilter instances.
+    @classmethod
+    def _from_portable(cls, f, magic):
+        header = magic + _read_exact(f, _SCALABLE_PORTABLE_HEADER.size - 4)
+        (_magic, version, header_len, payload_len, scale, ratio,
+         initial_capacity, error_rate, nfilters) = \
+            _SCALABLE_PORTABLE_HEADER.unpack(header)
 
-        Args:
-            f: File-like object opened in binary read mode ('rb')
+        if version != SCALABLE_PORTABLE_VERSION:
+            raise ValueError('Unsupported portable scalable Bloom filter version')
+        if header_len != _SCALABLE_PORTABLE_HEADER.size:
+            raise ValueError('Invalid scalable header length')
+        if payload_len > MAX_SCALABLE_PAYLOAD_BYTES:
+            raise ValueError('Payload length exceeds limit')
+        if scale not in (cls.SMALL_SET_GROWTH, cls.LARGE_SET_GROWTH):
+            raise ValueError('Invalid growth mode')
+        if not math.isfinite(ratio) or ratio <= 0 or ratio >= 1:
+            raise ValueError('Invalid tightening ratio')
+        if not 0 < initial_capacity <= MAX_BLOOM_CAPACITY:
+            raise ValueError('Unsupported initial capacity')
+        if not math.isfinite(error_rate) or not 0 < error_rate < 1:
+            raise ValueError('Invalid error rate')
+        if not 0 <= nfilters <= MAX_SCALABLE_FILTERS:
+            raise ValueError('Unsupported number of filters')
+        if nfilters == 0 and payload_len != 0:
+            raise ValueError('Invalid empty scalable payload')
 
-        Returns:
-            ScalableBloomFilter: A new ScalableBloomFilter instance with the
-                state loaded from the file
+        payload_hasher = hashlib.sha256(header)
+        payload_stream = _HashingReader(
+            _BoundedReader(f, payload_len), payload_hasher)
+        restored = cls.__new__(cls)
+        restored._setup(scale, ratio, initial_capacity, error_rate)
+        restored.filters = []
+        expected_capacity = initial_capacity
+        expected_error_rate = error_rate * ratio
 
-        Example:
-            >>> with open('scalable_filter.bin', 'rb') as f:
-            ...     sbf = ScalableBloomFilter.fromfile(f)
-            >>> 500 in sbf
-            True
+        for _ in range(nfilters):
+            inner = BloomFilter.fromfile(payload_stream)
+            if inner.capacity != expected_capacity:
+                raise ValueError('Scalable filter capacity mismatch')
+            if inner.error_rate != expected_error_rate:
+                raise ValueError('Scalable filter error rate mismatch')
+            restored.filters.append(inner)
+            expected_capacity *= scale
+            expected_error_rate *= ratio
 
-        Note:
-            Filters saved with version < 4.0.0 are incompatible due to hash
-            function changes (MD5 → xxHash).
-        """
-        filter = cls()
-        # Read main filter parameters
-        filter._setup(*unpack(cls.FILE_FMT, f.read(calcsize(cls.FILE_FMT))))
+        if payload_stream.remaining != 0:
+            raise ValueError('Scalable payload has trailing bytes')
+        checksum = _read_exact(f, hashlib.sha256().digest_size)
+        if checksum != payload_hasher.digest():
+            raise ValueError('Scalable Bloom filter checksum mismatch')
+        return restored
 
-        # Read number of internal filters
-        nfilters, = unpack(b'<l', f.read(calcsize(b'<l')))
+    @classmethod
+    def _from_legacy(cls, f, magic):
+        headerlen = calcsize(cls.FILE_FMT)
+        header = magic + _read_exact(f, headerlen - 4)
+        scale, ratio, initial_capacity, error_rate = unpack(cls.FILE_FMT, header)
+        count_bytes = _read_exact(f, calcsize(b'<l'))
+        nfilters, = unpack(b'<l', count_bytes)
+        if nfilters < 0 or nfilters > MAX_SCALABLE_FILTERS:
+            raise ValueError('Unsupported number of filters')
 
-        if nfilters > 0:
-            # Read size table
-            header_fmt = b'<' + b'Q' * nfilters
-            bytes = f.read(calcsize(header_fmt))
-            filter_lengths = unpack(header_fmt, bytes)
+        restored = cls.__new__(cls)
+        restored._setup(scale, ratio, initial_capacity, error_rate)
+        restored.filters = []
+        if nfilters == 0:
+            return restored
 
-            # Read each internal filter
-            for fl in filter_lengths:
-                filter.filters.append(BloomFilter.fromfile(f, fl))
-        else:
-            filter.filters = []
-
-        return filter
+        size_table = _read_exact(f, calcsize(b'Q') * nfilters)
+        filter_lengths = unpack(b'<' + b'Q' * nfilters, size_table)
+        if any(length > MAX_BLOOM_PAYLOAD_BYTES * 2 for length in filter_lengths):
+            raise ValueError('Legacy Bloom filter length exceeds limit')
+        for filter_len in filter_lengths:
+            restored.filters.append(BloomFilter.fromfile(f, filter_len, legacy=True))
+        return restored
 
     def __len__(self):
         """Return the total number of elements across all internal filters.
