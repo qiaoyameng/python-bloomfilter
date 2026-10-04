@@ -13,6 +13,7 @@ Test Coverage:
 - ScalableBloomFilter scaling behavior
 """
 import io
+import math
 import pickle
 import random
 import tempfile
@@ -20,6 +21,26 @@ import tempfile
 import pytest
 
 from pybloom_live.pybloom import BloomFilter, ScalableBloomFilter, make_hashfuncs
+
+
+def _make_raw_filter(num_slices, bits_per_slice, error_rate=0.01,
+                     capacity=None):
+    """Build a BloomFilter with an explicit geometry (test helper).
+
+    Mirrors the internal restoration path used by ``fromfile`` so tests can
+    exercise exact slice sizes (including overfilled, collision-heavy ones).
+    """
+    bf = BloomFilter.__new__(BloomFilter)
+    nominal_capacity = int(
+        (num_slices * bits_per_slice * (math.log(2) ** 2))
+        / abs(math.log(error_rate)))
+    bf._setup(error_rate, num_slices, bits_per_slice,
+              capacity if capacity is not None else max(nominal_capacity, 1),
+              0)
+    import bitarray as _bitarray
+    bf.bitarray = _bitarray.bitarray(bf.num_bits, endian='little')
+    bf.bitarray.setall(False)
+    return bf
 
 
 # =============================================================================
@@ -1137,6 +1158,316 @@ class TestEdgeCases:
         large_string = "x" * 10000
         bf.add(large_string)
         assert large_string in bf
+
+
+# =============================================================================
+# Fold / Fold-compatible Union Tests
+# =============================================================================
+
+
+class TestFoldPreconditions:
+    """Validate fold compatibility rules and error handling."""
+
+    def test_fold_rejects_non_divisor(self):
+        bf = _make_raw_filter(7, 100)
+        with pytest.raises(ValueError, match="must divide source"):
+            bf.fold(60)
+
+    def test_fold_rejects_equal_size(self):
+        bf = _make_raw_filter(7, 100)
+        with pytest.raises(ValueError, match="only shrinks"):
+            bf.fold(100)
+
+    def test_fold_rejects_larger_size(self):
+        bf = _make_raw_filter(7, 100)
+        with pytest.raises(ValueError, match="only shrinks"):
+            bf.fold(200)
+
+    def test_fold_rejects_non_integer(self):
+        bf = _make_raw_filter(7, 100)
+        with pytest.raises(TypeError):
+            bf.fold(50.0)
+
+    def test_fold_rejects_hash_regime_threshold(self):
+        # Source 3*(2**15-1) (fmt 'I', SHA-256 for k=7) folds to
+        # 2**15-1 (fmt 'H', xxh128); the target divides the source but both
+        # the fmt_code and hashfn switch at the boundary, so fold is refused.
+        src = 3 * ((1 << 15) - 1)
+        bf = _make_raw_filter(7, src)
+        with pytest.raises(ValueError, match="hash algorithm threshold"):
+            bf.fold((1 << 15) - 1)
+
+    def test_fold_does_not_promised_expansion(self):
+        bf = _make_raw_filter(7, 50)
+        assert not hasattr(bf, 'unfold'), "folding must be one-way"
+        small = bf.fold(25)
+        assert not hasattr(small, 'unfold')
+
+
+class TestFoldHashMapping:
+    """Verify make_hashes satisfies the mathematical fold identity."""
+
+    def test_hash_residues_fold_identity_within_regime(self):
+        # Both slice sizes use the same (fmt_code, hashfn) regime and
+        # dst divides src, so raw uints are identical and modulo nesting
+        # must hold: (x % src) % dst == x % dst.
+        num_slices = 7
+        src, dst = 200, 50
+        assert BloomFilter.same_hash_regime(num_slices, src, dst)
+
+        src_maker, _ = make_hashfuncs(num_slices, src)
+        dst_maker, _ = make_hashfuncs(num_slices, dst)
+        for key in [str(i) for i in range(200)] + ['世界', b'raw', 42, '']:
+            src_residues = list(src_maker(key))
+            dst_residues = list(dst_maker(key))
+            assert len(src_residues) == num_slices
+            assert [r % dst for r in src_residues] == dst_residues
+
+    def test_hash_regime_changes_across_threshold(self):
+        # Just below/at the H->I fmt_code boundary the regimes differ;
+        # fold compatibility must be False.
+        assert not BloomFilter.same_hash_regime(7, (1 << 15) - 1, 1 << 15)
+
+    def test_membership_uses_folded_geometry(self):
+        # A key inserted via a folded filter must land on the same bit the
+        # unfolded filter would have projected it to.
+        bf = _make_raw_filter(5, 80)
+        bf.add('edge-key')
+        small = bf.fold(20)
+        assert 'edge-key' in small
+
+
+class TestFoldBitmapCorrectness:
+    """Per-slice modular merge must not mix slice boundaries."""
+
+    def test_fold_matches_independent_per_slice_projection(self):
+        num_slices, bps, new_bps = 6, 60, 12
+        bf = _make_raw_filter(num_slices, bps, capacity=100000)
+        random.Random(1234).shuffle(bf.bitarray)
+        for _ in range(40):
+            bf.add(random.randint(0, 10000))
+
+        folded = bf.fold(new_bps)
+
+        # Reference projection: fold every slice independently.
+        expected = bytearray(folded.num_bits)
+        for s in range(num_slices):
+            for pos in range(bps):
+                if bf.bitarray[s * bps + pos]:
+                    expected[s * new_bps + pos % new_bps] = 1
+
+        assert list(folded.bitarray) == list(expected)
+
+    def test_whole_bitarray_modulo_is_distinguishable(self):
+        # Taking index % new_bps over the whole bitarray (without slicing)
+        # maps the second slice onto the first one. Correct folding must NOT
+        # equal that buggy projection when slices differ in content.
+        num_slices, bps, new_bps = 4, 40, 20
+        bf = _make_raw_filter(num_slices, bps)
+        bf.bitarray[1 * bps + 5] = True   # bit only in the second slice
+        folded = bf.fold(new_bps)
+
+        buggy = bytearray(new_bps)
+        for pos in range(num_slices * bps):
+            if bf.bitarray[pos]:
+                buggy[pos % new_bps] = 1
+
+        # Correct fold keeps the bit in slice 1 at offset 5.
+        assert folded.bitarray[1 * new_bps + 5]
+        # Buggy whole-array modulo would also set slice-0 offset 5.
+        assert buggy[5] and not folded.bitarray[5]
+
+
+class TestFoldRecallCollisionHeavy:
+    """With many collisions in a tiny filter no inserted key may be lost."""
+
+    def test_all_inserted_keys_still_hit_after_folding(self):
+        num_slices, bps = 5, 120
+        bf = _make_raw_filter(num_slices, bps, error_rate=0.5,
+                              capacity=100000)
+        keys = ['host-%04d/metric' % i for i in range(300)]
+        for k in keys:
+            bf.add(k, skip_check=True)
+
+        for factor in (2, 3, 4, 6):
+            small = bf.fold(bps // factor)
+            assert small.bits_per_slice == bps // factor
+            missing = [k for k in keys if k not in small]
+            assert missing == [], (
+                "fold x%d lost %d inserted keys" % (factor, len(missing)))
+            # Folding a saturated filter only increases occupancy.
+            assert small.fill_ratio >= bf.fill_ratio
+
+        # Even the most aggressive fold (20 bits/slice = 100 bits total for
+        # 300 keys) must have zero false negatives.
+        tiny = bf.fold(20)
+        assert tiny.fill_ratio > 0.9
+        assert all(k in tiny for k in keys)
+
+
+class TestChainedFold:
+    """Chained folding and one-step folding produce the same bitmap."""
+
+    def test_one_step_vs_two_step_bitmap(self, capsys):
+        num_slices, bps = 5, 240
+        bf = _make_raw_filter(num_slices, bps)
+        for i in range(80):
+            bf.add('node-%d' % i)
+
+        one_step = bf.fold(60)                       # 240 -> 60 (x4)
+        two_step = bf.fold(120).fold(60)            # 240 -> 120 -> 60
+
+        assert one_step.bits_per_slice == two_step.bits_per_slice == 60
+        assert one_step.bitarray == two_step.bitarray
+        assert one_step.fill_ratio == two_step.fill_ratio
+        assert (one_step.estimated_false_positive_rate
+                == two_step.estimated_false_positive_rate)
+
+        # Visible proof of the identical bitmaps for review.
+        with capsys.disabled():
+            print()
+            print("one-step fold bitmap:", one_step.bitarray.to01())
+            print("two-step fold bitmap:", two_step.bitarray.to01())
+
+    def test_fold_history_records_chain(self):
+        bf = _make_raw_filter(5, 240)
+        chained = bf.fold(120).fold(60)
+        assert chained.fold_history == [(240, 120), (120, 60)]
+        assert bf.fold(60).fold_history == [(240, 60)]
+
+    def test_chain_order_associative(self):
+        bf = _make_raw_filter(5, 240)
+        assert (bf.fold(80).fold(40).bitarray
+                == bf.fold(120).fold(40).bitarray
+                == bf.fold(40).bitarray)
+
+
+class TestFoldEstimates:
+    """Post-fold occupancy and false positive estimate are exposed."""
+
+    def test_estimates_on_folded_filter(self):
+        bf = _make_raw_filter(5, 200, capacity=100000)
+        for i in range(120):
+            bf.add('k-%d' % i)
+        small = bf.fold(100)
+
+        assert 0.0 < small.fill_ratio <= 1.0
+        assert len(small.slice_fill_ratios) == 5
+        # Empirical fpp follows occupancy and rises after folding.
+        assert (small.estimated_false_positive_rate
+                >= bf.estimated_false_positive_rate)
+        # Nominal capacity belongs to the new geometry, not the original.
+        assert small.capacity < int(
+            (5 * 200 * (math.log(2) ** 2)) / abs(math.log(bf.error_rate)))
+        # Count is an occupancy-derived estimate; never claims the old count.
+        assert small.count >= 0
+
+    def test_estimates_empty_filter(self):
+        bf = _make_raw_filter(5, 100)
+        assert bf.fill_ratio == 0.0
+        assert bf.estimated_false_positive_rate == 0.0
+        folded = bf.fold(50)
+        assert folded.count == 0
+        assert folded.fill_ratio == 0.0
+
+
+class TestFoldedUnion:
+    """Union built on fold(): differing but compatible sizes collapse first."""
+
+    def _pair(self):
+        large = _make_raw_filter(7, 200)
+        small = _make_raw_filter(7, 100)
+        for i in range(0, 40):
+            large.add('big-%d' % i)
+        for i in range(100, 140):
+            small.add('small-%d' % i)
+        return large, small
+
+    def test_folded_union_collapses_to_smaller_size(self):
+        large, small = self._pair()
+        merged = large.union(small, fold=True)
+        assert merged.bits_per_slice == 100
+        assert all('big-%d' % i in merged for i in range(40))
+        assert all('small-%d' % i in merged for i in range(100, 140))
+
+    def test_folded_union_symmetric(self):
+        large, small = self._pair()
+        assert (large.folded_union(small).bitarray
+                == small.folded_union(large).bitarray)
+
+    def test_plain_union_still_rejects_different_sizes(self):
+        large, small = self._pair()
+        with pytest.raises(ValueError, match="same capacity and error rate"):
+            large.union(small)
+
+    def test_folded_union_rejects_non_divisor(self):
+        large = _make_raw_filter(7, 200)
+        other = _make_raw_filter(7, 120)
+        with pytest.raises(ValueError, match="not fold-compatible"):
+            large.folded_union(other)
+
+    def test_folded_union_rejects_different_slice_count(self):
+        large = _make_raw_filter(7, 200)
+        other = _make_raw_filter(5, 100)
+        with pytest.raises(ValueError, match="number of hash slices"):
+            large.folded_union(other)
+
+    def test_folded_union_rejects_different_error_rate(self):
+        large = _make_raw_filter(7, 200, error_rate=0.01)
+        other = _make_raw_filter(7, 100, error_rate=0.02)
+        with pytest.raises(ValueError, match="same error rate"):
+            large.folded_union(other)
+
+
+class TestFoldSerialization:
+    """Folded filters round-trip through the binary format and pickle."""
+
+    def test_folded_filter_tofile_fromfile(self):
+        bf = _make_raw_filter(7, 200)
+        keys = ['ser-%d' % i for i in range(60)]
+        for k in keys:
+            bf.add(k)
+        folded = bf.fold(50)
+
+        with tempfile.TemporaryFile(mode='w+b') as f:
+            folded.tofile(f)
+            f.seek(0)
+            restored = BloomFilter.fromfile(f)
+
+        assert restored.bits_per_slice == 50
+        assert restored.num_slices == 7
+        # fromfile pads to whole bytes; compare the meaningful prefix.
+        assert restored.bitarray[:folded.num_bits] == folded.bitarray
+        assert all(k in restored for k in keys)
+        # Functional state is fully restored.
+        assert (restored.estimated_false_positive_rate
+                == folded.estimated_false_positive_rate)
+
+    def test_chained_fold_pickle_preserves_history(self):
+        bf = _make_raw_filter(7, 240)
+        for i in range(50):
+            bf.add('p-%d' % i)
+        chained = bf.fold(120).fold(60)
+
+        restored = pickle.loads(pickle.dumps(chained))
+        assert restored.fold_history == [(240, 120), (120, 60)]
+        assert restored.bitarray == chained.bitarray
+        assert all('p-%d' % i in restored for i in range(50))
+
+    def test_folded_filter_can_fold_again_after_restore(self):
+        bf = _make_raw_filter(7, 200)
+        for i in range(40):
+            bf.add('r-%d' % i)
+        folded = bf.fold(100)
+
+        buffer = io.BytesIO()
+        folded.tofile(buffer)
+        buffer.seek(0)
+        restored = BloomFilter.fromfile(buffer)
+
+        again = restored.fold(50)
+        assert again.bits_per_slice == 50
+        assert all('r-%d' % i in again for i in range(40))
 
 
 if __name__ == '__main__':

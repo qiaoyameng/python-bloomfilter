@@ -34,6 +34,51 @@ except ImportError:
     raise ImportError('pybloom_live requires bitarray >= 0.3.4')
 
 
+def select_hash_regime(num_slices, num_bits):
+    """Select the integer unpacking format and underlying hash function.
+
+    Folding is only valid while the *raw* hash uints stay identical, so the
+    pair (fmt_code, hashfn) selected here is the "hash regime" that fold
+    compatibility checks compare. The selection changes at two kinds of
+    thresholds:
+
+    - ``num_bits`` crossing ``1 << 15`` / ``1 << 31`` changes ``fmt_code``;
+    - ``8 * num_slices * chunk_size`` crossing 128/160/256/384 bits changes
+      ``hashfn``.
+
+    A source slice size and a target slice size that fall on different sides
+    of these thresholds do not share a hash regime and must never be folded
+    together.
+
+    Args:
+        num_slices (int): Number of hash functions (k).
+        num_bits (int): Number of bits per hash slice (m).
+
+    Returns:
+        tuple: ``(fmt_code, chunk_size, hashfn)``
+    """
+    if num_bits >= (1 << 31):
+        fmt_code, chunk_size = 'Q', 8  # 64-bit unsigned long long
+    elif num_bits >= (1 << 15):
+        fmt_code, chunk_size = 'I', 4  # 32-bit unsigned int
+    else:
+        fmt_code, chunk_size = 'H', 2  # 16-bit unsigned short
+
+    total_hash_bits = 8 * num_slices * chunk_size
+    if total_hash_bits > 384:
+        hashfn = hashlib.sha512
+    elif total_hash_bits > 256:
+        hashfn = hashlib.sha384
+    elif total_hash_bits > 160:
+        hashfn = hashlib.sha256
+    elif total_hash_bits > 128:
+        hashfn = hashlib.sha1
+    else:
+        hashfn = xxhash.xxh128
+
+    return fmt_code, chunk_size, hashfn
+
+
 def make_hashfuncs(num_slices, num_bits):
     """Create optimized hash functions for the Bloom filter.
 
@@ -68,26 +113,8 @@ def make_hashfuncs(num_slices, num_bits):
         - Single hash computation generates multiple independent values
         - Format codes are optimized for the bit array size
     """
-    # Select format code based on number of bits to optimize struct unpacking
-    if num_bits >= (1 << 31):
-        fmt_code, chunk_size = 'Q', 8  # 64-bit unsigned long long
-    elif num_bits >= (1 << 15):
-        fmt_code, chunk_size = 'I', 4  # 32-bit unsigned int
-    else:
-        fmt_code, chunk_size = 'H', 2  # 16-bit unsigned short
-
-    # Calculate total bits needed and select appropriate hash function
-    total_hash_bits = 8 * num_slices * chunk_size
-    if total_hash_bits > 384:
-        hashfn = hashlib.sha512
-    elif total_hash_bits > 256:
-        hashfn = hashlib.sha384
-    elif total_hash_bits > 160:
-        hashfn = hashlib.sha256
-    elif total_hash_bits > 128:
-        hashfn = hashlib.sha1
-    else:
-        hashfn = xxhash.xxh128  # Fastest option for typical filters
+    # Select format code and hash function ("hash regime")
+    fmt_code, chunk_size, hashfn = select_hash_regime(num_slices, num_bits)
 
     # Pre-compute format string for unpacking hash digests
     fmt = fmt_code * (hashfn().digest_size // chunk_size)
@@ -139,6 +166,10 @@ def make_hashfuncs(num_slices, num_bits):
 
 class BloomFilter:
     FILE_FMT = b'<dQQQQ'
+    # Key normalization used by make_hashfuncs: str -> this encoding,
+    # bytes pass through, any other object -> str(obj) -> this encoding.
+    # Folding requires both filters to share the same key encoding.
+    KEY_ENCODING = 'utf-8'
 
     def __init__(self, capacity, error_rate=0.001):
         """Initialize a Bloom filter with specified capacity and error rate.
@@ -222,6 +253,75 @@ class BloomFilter:
         self.num_bits = num_slices * bits_per_slice
         self.count = count
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        # Record of fold steps applied as (old_bits_per_slice, new_bits_per_slice).
+        # Populated by fold(); empty for a filter created at its current size.
+        self.fold_history = []
+
+    # ------------------------------------------------------------------
+    # Occupancy and false positive estimation
+    # ------------------------------------------------------------------
+    @property
+    def fill_ratio(self):
+        """Fraction of all bits currently set (overall occupancy).
+
+        Returns:
+            float: Number of set bits divided by ``num_bits``.
+        """
+        if self.num_bits == 0:
+            return 0.0
+        return self.bitarray.count() / self.num_bits
+
+    @property
+    def slice_fill_ratios(self):
+        """Occupancy of each hash slice individually.
+
+        Returns:
+            list[float]: One fill fraction per slice (k entries).
+        """
+        bps = self.bits_per_slice
+        bits = self.bitarray
+        return [bits[s * bps:(s + 1) * bps].count() / bps
+                for s in range(self.num_slices)]
+
+    @property
+    def estimated_false_positive_rate(self):
+        """Empirical false positive probability implied by the current bitmap.
+
+        For a partitioned Bloom filter (one distinct slice per hash
+        function), a fresh random key is a false positive iff its bit is set
+        in *every* slice, so this is the product of the per-slice fill
+        fractions. This estimate follows the actual bitmap and therefore
+        stays meaningful after folding, unlike the nominal ``error_rate``
+        parameter which describes the design target of a fresh filter.
+
+        Returns:
+            float: Estimated current false positive probability.
+        """
+        rate = 1.0
+        for fill in self.slice_fill_ratios:
+            rate *= fill
+        return rate
+
+    def _estimated_element_count(self):
+        """Estimate the number of inserted keys from mean slice occupancy.
+
+        Each slice receives exactly one uniformly distributed bit per
+        inserted key, so with mean fill ``p``::
+
+            p = 1 - exp(-n / bits_per_slice)
+            n = -bits_per_slice * ln(1 - p)
+
+        This is an estimate and becomes a lower bound as collisions pile up.
+        A fully saturated filter cannot be inverted; return the number of
+        set bits (still a conservative lower bound) in that case.
+        """
+        fills = self.slice_fill_ratios
+        mean_fill = sum(fills) / len(fills)
+        if mean_fill <= 0.0:
+            return 0
+        if mean_fill >= 1.0:
+            return self.bitarray.count()
+        return int(round(-self.bits_per_slice * math.log(1.0 - mean_fill)))
 
     def __contains__(self, key):
         """Test whether an element is in the Bloom filter.
@@ -383,9 +483,241 @@ class BloomFilter:
         new_filter = BloomFilter(self.capacity, self.error_rate)
         new_filter.bitarray = self.bitarray.copy()
         new_filter.count = self.count  # Preserve count
+        new_filter.fold_history = list(self.fold_history)
         return new_filter
 
-    def union(self, other):
+    # ------------------------------------------------------------------
+    # Folding
+    # ------------------------------------------------------------------
+    @classmethod
+    def same_hash_regime(cls, num_slices, src_bits, dst_bits):
+        """Check whether two slice sizes share the same hash regime.
+
+        Folding relies on the raw hash uints being identical for both sizes,
+        so that ``x % dst == (x % src) % dst`` holds. This is only true when
+        both configurations select the same ``(fmt_code, hashfn)`` pair in
+        :func:`select_hash_regime`.
+
+        Args:
+            num_slices (int): Number of hash slices (k).
+            src_bits (int): Source bits per slice.
+            dst_bits (int): Target bits per slice.
+
+        Returns:
+            bool: True if both sizes use the same fmt_code and hashfn.
+        """
+        src_fmt, _, src_hashfn = select_hash_regime(num_slices, src_bits)
+        dst_fmt, _, dst_hashfn = select_hash_regime(num_slices, dst_bits)
+        return src_fmt == dst_fmt and src_hashfn is dst_hashfn
+
+    def _check_fold_compatible(self, new_bits_per_slice):
+        """Validate that this filter can fold to the requested slice size.
+
+        Compatibility conditions:
+
+        - target size is a positive integer strictly smaller than the current
+          slice size (folding only shrinks; expansion is impossible);
+        - the current ``bits_per_slice`` is an exact multiple of the target,
+          so modular reduction maps whole residue classes;
+        - the source and target slice sizes select the same hash regime
+          (same fmt_code and hashfn) in :func:`make_hashfuncs`, guaranteeing
+          the raw hash values coincide and ``x % dst == (x % src) % dst``;
+        - the hash slice count and key encoding are by definition unchanged,
+          since folding returns a filter of the same class.
+
+        Raises:
+            TypeError: If ``new_bits_per_slice`` is not an integer.
+            ValueError: If any compatibility condition fails.
+        """
+        if not isinstance(new_bits_per_slice, int):
+            raise TypeError("new_bits_per_slice must be an integer")
+        if new_bits_per_slice <= 0:
+            raise ValueError("new_bits_per_slice must be > 0")
+        if new_bits_per_slice >= self.bits_per_slice:
+            raise ValueError(
+                "Folding only shrinks: new_bits_per_slice (%d) must be "
+                "smaller than bits_per_slice (%d)"
+                % (new_bits_per_slice, self.bits_per_slice))
+        if not self.same_hash_regime(
+                self.num_slices, self.bits_per_slice, new_bits_per_slice):
+            src_fmt, _, src_hashfn = select_hash_regime(
+                self.num_slices, self.bits_per_slice)
+            dst_fmt, _, dst_hashfn = select_hash_regime(
+                self.num_slices, new_bits_per_slice)
+            raise ValueError(
+                "Cannot fold across a hash algorithm threshold: source slice "
+                "length %d uses regime (%s, %s) but target %d uses (%s, %s)"
+                % (self.bits_per_slice, src_fmt, src_hashfn.__name__,
+                   new_bits_per_slice, dst_fmt, dst_hashfn.__name__))
+        if self.bits_per_slice % new_bits_per_slice != 0:
+            raise ValueError(
+                "Cannot fold: target slice length %d must divide source "
+                "slice length %d"
+                % (new_bits_per_slice, self.bits_per_slice))
+
+    def fold(self, new_bits_per_slice):
+        """Fold this filter down to a smaller per-slice size.
+
+        Every slice of length ``m`` is projected onto a slice of length
+        ``m'`` (where ``m'`` divides ``m``) by OR-ing bits at positions that
+        share the same residue modulo ``m'``::
+
+            folded[j] |= original[j + t * m']   for j in [0, m')
+
+        Because the hash function returns ``uint % m`` and the raw uints are
+        unchanged across compatible slice sizes, a bit set for hash residue
+        ``r`` in the source lands exactly at ``r % m'`` in the target, which
+        is the position the same key hashes to in the folded filter. Hence no
+        inserted key is ever lost (no false negatives introduced); collisions
+        only increase and the false positive rate goes up.
+
+        The fold is performed independently per slice: taking
+        ``index % new_bits_per_slice`` over the *whole* bitarray would mix
+        positions belonging to different slices and corrupt the filter.
+
+        The returned filter does **not** inherit the original capacity/count
+        guarantee. Its ``capacity`` is the nominal capacity of an empty
+        filter with the new geometry at the same design ``error_rate``, and
+        ``count`` is estimated from occupancy. Inspect
+        :attr:`fill_ratio` and :attr:`estimated_false_positive_rate` for the
+        post-fold reality.
+
+        Folding is one-way. There is deliberately no inverse "expand"
+        operation: a folded bitmap cannot be losslessly grown back into the
+        larger size because the OR projection discards which residue class
+        held each set bit.
+
+        Args:
+            new_bits_per_slice (int): Target bits per slice; must be a
+                positive divisor of the current size and share its hash
+                regime.
+
+        Returns:
+            BloomFilter: A new, smaller filter containing every key this
+            filter contained (possibly with more false positives).
+
+        Raises:
+            ValueError: If the target size does not divide the source, does
+                not shrink it, or crosses a hash algorithm threshold.
+
+        Example:
+            >>> bf = BloomFilter(1000, 0.001)
+            >>> bf.add("edge-node/key")
+            False
+            >>> small = bf.fold(bf.bits_per_slice // 2)
+            >>> "edge-node/key" in small
+            True
+        """
+        self._check_fold_compatible(new_bits_per_slice)
+
+        old_bps = self.bits_per_slice
+        new_bps = new_bits_per_slice
+        folded_bits = bitarray.bitarray(self.num_slices * new_bps,
+                                        endian='little')
+        folded_bits.setall(False)
+
+        # Fold each slice in isolation so slice boundaries are preserved.
+        for s in range(self.num_slices):
+            src_start = s * old_bps
+            dst_start = s * new_bps
+            src_slice = self.bitarray[src_start:src_start + old_bps]
+            for t in range(old_bps // new_bps):
+                folded_bits[dst_start:dst_start + new_bps] |= \
+                    src_slice[t * new_bps:(t + 1) * new_bps]
+
+        new_filter = BloomFilter.__new__(BloomFilter)
+        # Nominal capacity for the new geometry at the original design rate.
+        # This is not a guarantee about the data actually carried over.
+        nominal_capacity = int(
+            (self.num_slices * new_bps * (math.log(2) ** 2))
+            / abs(math.log(self.error_rate)))
+        new_filter._setup(
+            self.error_rate, self.num_slices, new_bps,
+            nominal_capacity, 0)
+        new_filter.bitarray = folded_bits
+        new_filter.count = new_filter._estimated_element_count()
+        new_filter.fold_history = self.fold_history + [(old_bps, new_bps)]
+        return new_filter
+
+    def folded_union(self, other):
+        """Union two compatible filters, folding the larger one down first.
+
+        Unlike :meth:`union`, which requires identically sized filters, this
+        method tolerates different capacities as long as the filters are
+        fold-compatible:
+
+        - same ``num_slices`` (hash count k);
+        - same ``error_rate`` (same key-space design parameters);
+        - same key encoding (:attr:`KEY_ENCODING`);
+        - same hash regime for both slice sizes;
+        - the larger ``bits_per_slice`` is an exact multiple of the smaller.
+
+        The larger filter is folded to the smaller slice size via
+        :meth:`fold`, then the two equal-size bitmaps are OR-ed. The result
+        has the *smaller* geometry, reports occupancy-derived estimates, and
+        must not be read as carrying either filter's original capacity or
+        count guarantee.
+
+        Args:
+            other (BloomFilter): The filter to merge with.
+
+        Returns:
+            BloomFilter: Union at the smaller of the two slice sizes.
+
+        Raises:
+            ValueError: If the filters are not fold-compatible.
+        """
+        if not isinstance(other, BloomFilter):
+            raise ValueError("folded_union requires a BloomFilter")
+        if self.KEY_ENCODING != other.KEY_ENCODING:
+            raise ValueError(
+                "Unioning filters requires the same key encoding "
+                "(%r != %r)" % (self.KEY_ENCODING, other.KEY_ENCODING))
+        if self.num_slices != other.num_slices:
+            raise ValueError(
+                "Unioning filters requires the same number of hash slices "
+                "(%d != %d)" % (self.num_slices, other.num_slices))
+        if self.error_rate != other.error_rate:
+            raise ValueError(
+                "Unioning filters requires the same error rate (%r != %r)"
+                % (self.error_rate, other.error_rate))
+
+        self_bps = self.bits_per_slice
+        other_bps = other.bits_per_slice
+        if self_bps == other_bps:
+            target = self
+            folded_other = other
+        elif self_bps > other_bps:
+            if self_bps % other_bps != 0 or not self.same_hash_regime(
+                    self.num_slices, self_bps, other_bps):
+                raise ValueError(
+                    "Filters are not fold-compatible: slice length %d cannot "
+                    "be folded to %d" % (self_bps, other_bps))
+            target = self.fold(other_bps)
+            folded_other = other
+        else:
+            if other_bps % self_bps != 0 or not other.same_hash_regime(
+                    other.num_slices, other_bps, self_bps):
+                raise ValueError(
+                    "Filters are not fold-compatible: slice length %d cannot "
+                    "be folded to %d" % (other_bps, self_bps))
+            target = self
+            folded_other = other.fold(self_bps)
+
+        merged = BloomFilter.__new__(BloomFilter)
+        merged._setup(
+            target.error_rate, target.num_slices, target.bits_per_slice,
+            target.capacity, 0)
+        merged.bitarray = target.bitarray | folded_other.bitarray
+        merged.count = merged._estimated_element_count()
+        merged.fold_history = list(target.fold_history)
+        if other is folded_other:
+            merged.fold_history.extend(other.fold_history)
+        else:
+            merged.fold_history.extend(folded_other.fold_history)
+        return merged
+
+    def union(self, other, fold=False):
         """Calculate the union of two Bloom filters.
 
         Creates a new Bloom filter containing elements that are in either this
@@ -395,12 +727,17 @@ class BloomFilter:
         Args:
             other (BloomFilter): Another Bloom filter to union with this one.
                 Must have the same capacity and error rate.
+            fold (bool, optional): If True, also accept filters with
+                different but fold-compatible slice sizes; the larger filter
+                is folded down to the smaller size before the OR. Defaults to
+                False, which requires identical capacity and error rate.
 
         Returns:
             BloomFilter: A new filter representing the union of both filters
 
         Raises:
             ValueError: If filters have different capacities or error rates
+                (or, when ``fold=True``, if they are not fold-compatible)
 
         Time Complexity:
             O(M) where M is the size of the bit array
@@ -417,7 +754,12 @@ class BloomFilter:
         Note:
             The count in the resulting filter may not be accurate as it cannot
             account for elements present in both filters.
+            With ``fold=True`` the result keeps the smaller geometry; its
+            capacity/count are occupancy-derived estimates rather than the
+            original guarantees.
         """
+        if fold:
+            return self.folded_union(other)
         if self.capacity != other.capacity or self.error_rate != other.error_rate:
             raise ValueError(
                 "Unioning filters requires both filters to have both the same capacity and error rate")
@@ -609,6 +951,8 @@ class BloomFilter:
         self.__dict__.update(d)
         # Reconstruct hash function generator
         self.make_hashes, self.hashfn = make_hashfuncs(self.num_slices, self.bits_per_slice)
+        # fold_history was introduced after 4.0.0; tolerate older pickles.
+        self.__dict__.setdefault('fold_history', [])
 
 
 class ScalableBloomFilter:
